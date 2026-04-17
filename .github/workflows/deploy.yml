@@ -3,8 +3,15 @@ name: Deploy DeployWeave
 on:
   push:
     branches:
-      - main
+      - main        # always deploys to prod
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options: [sandbox, dev, staging, prod]
 
 permissions:
   id-token: write   # required for AWS OIDC token exchange
@@ -29,10 +36,12 @@ jobs:
         run: python -m pytest unit_tests.py -v
 
   deploy:
-    name: SAM Deploy
+    name: SAM Deploy (${{ github.event.inputs.environment || 'prod' }})
     runs-on: ubuntu-latest
     needs: test
-    environment: prod
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+    env:
+      TARGET_ENV: ${{ github.event.inputs.environment || 'prod' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +60,7 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
           aws-region: us-east-1
-          role-session-name: deployweave-gh-${{ github.run_id }}
+          role-session-name: deployweave-${{ env.TARGET_ENV }}-${{ github.run_id }}
 
       - name: SAM Build
         run: sam build --use-container
@@ -61,7 +70,39 @@ jobs:
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
-            --stack-name deployweave-prod \
-            --parameter-overrides Environment=prod \
+            --stack-name deployweave-${{ env.TARGET_ENV }} \
+            --parameter-overrides Environment=${{ env.TARGET_ENV }} \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --region us-east-1
+
+  # Sandbox stacks self-destruct after 1 hour.
+  # This job holds the runner for 60 min then tears down the stack.
+  sandbox-teardown:
+    name: Sandbox Teardown (1 hr TTL)
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: ${{ github.event.inputs.environment == 'sandbox' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
+          aws-region: us-east-1
+          role-session-name: deployweave-sandbox-teardown-${{ github.run_id }}
+
+      - name: Wait 1 hour
+        run: sleep 3600
+
+      - name: Delete sandbox stack
+        run: |
+          sam delete \
+            --stack-name deployweave-sandbox \
+            --no-prompts \
             --region us-east-1
