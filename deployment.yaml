@@ -19,7 +19,7 @@ Parameters:
   Environment:
     Type: String
     Default: dev
-    AllowedValues: [dev, staging, prod]
+    AllowedValues: [sandbox, dev, staging, prod]
     Description: Deployment environment
 
 # ============================================================
