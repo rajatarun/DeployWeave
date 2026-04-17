@@ -1,0 +1,74 @@
+name: Deploy DeployWeave
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+
+permissions:
+  id-token: write   # required for AWS OIDC token exchange
+  contents: read
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest unit_tests.py -v
+
+  deploy:
+    name: SAM Deploy
+    runs-on: ubuntu-latest
+    needs: test
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: pip
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
+          aws-region: us-east-1
+          role-session-name: deployweave-gh-${{ github.run_id }}
+
+      - name: SAM Build
+        run: sam build --use-container
+
+      - name: SAM Deploy
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name deployweave-${{ github.event.inputs.environment || 'dev' }} \
+            --parameter-overrides Environment=${{ github.event.inputs.environment || 'dev' }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --region us-east-1
