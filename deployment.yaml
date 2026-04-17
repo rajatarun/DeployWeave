@@ -4,7 +4,7 @@ Description: DeployWeave - Modular MCP Tool Suite for AWS Bedrock (pay-per-reque
 
 Globals:
   Function:
-    Runtime: python3.9
+    Runtime: python3.11
     Timeout: 300
     MemorySize: 256
     Environment:
@@ -19,7 +19,7 @@ Parameters:
   Environment:
     Type: String
     Default: dev
-    AllowedValues: [dev, staging, prod]
+    AllowedValues: [sandbox, dev, staging, prod]
     Description: Deployment environment
 
 # ============================================================
