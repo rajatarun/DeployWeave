@@ -678,5 +678,436 @@ class TestStreamsToSQS(unittest.TestCase):
         self.assertEqual(result["statusCode"], 200)
 
 
+# ---------------------------------------------------------------------------
+# TestLoraValidator
+# ---------------------------------------------------------------------------
+
+class TestLoraValidator(unittest.TestCase):
+    def _validate(self, model, lora_adapter_id):
+        import lora_validator as lv
+        return lv.validate_lora_compatibility(model, lora_adapter_id)
+
+    def test_no_adapter_always_passes(self):
+        self.assertTrue(self._validate("anything.model", None))
+
+    def test_empty_string_adapter_passes(self):
+        self.assertTrue(self._validate("anthropic.claude-3-opus", ""))
+
+    def test_titan_model_compatible(self):
+        self.assertTrue(self._validate("amazon.titan-text-express-v1", "adapter-1"))
+
+    def test_llama_model_compatible(self):
+        self.assertTrue(self._validate("meta.llama2-13b-chat-v1", "adapter-1"))
+
+    def test_claude_model_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self._validate("anthropic.claude-3-haiku-20240307-v1:0", "adapter-x")
+
+    def test_error_message_mentions_model(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._validate("anthropic.claude-3-opus-20240229-v1:0", "adapter-x")
+        self.assertIn("anthropic.claude", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# TestReservationManager
+# ---------------------------------------------------------------------------
+
+class TestReservationManager(unittest.TestCase):
+    def _make_reservation_item(self, reservation_id, input_reserved=100, output_reserved=200):
+        return {
+            "Item": {
+                "contract_id": "c1",
+                "reservations": {
+                    reservation_id: {
+                        "input_reserved": input_reserved,
+                        "output_reserved": output_reserved,
+                        "created_at": int(time.time()),
+                        "status": "pending",
+                    }
+                },
+            }
+        }
+
+    def test_reserve_tokens_calls_update_item(self):
+        import reservation_manager as rm
+        mock_table = MagicMock()
+        with patch.object(rm, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            rm.reserve_tokens("c1", 100, 200, "res-1")
+        mock_table.update_item.assert_called_once()
+
+    def test_reserve_tokens_raises_on_conditional_failure(self):
+        import reservation_manager as rm
+        mock_table = MagicMock()
+        mock_table.update_item.side_effect = _client_error("ConditionalCheckFailedException")
+        with patch.object(rm, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            with self.assertRaises(ClientError) as ctx:
+                rm.reserve_tokens("c1", 9999999, 9999999, "res-x")
+        self.assertEqual(ctx.exception.response["Error"]["Code"], "ConditionalCheckFailedException")
+
+    def test_commit_tokens_fetches_reservation_then_updates(self):
+        import reservation_manager as rm
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = self._make_reservation_item("res-1")
+        with patch.object(rm, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            rm.commit_tokens("c1", "res-1", 80, 150, 0)
+        mock_table.get_item.assert_called_once()
+        mock_table.update_item.assert_called_once()
+
+    def test_release_reservation_fetches_then_updates(self):
+        import reservation_manager as rm
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = self._make_reservation_item("res-1")
+        with patch.object(rm, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            rm.release_reservation("c1", "res-1")
+        mock_table.get_item.assert_called_once()
+        mock_table.update_item.assert_called_once()
+
+    def test_release_nonexistent_reservation_is_noop(self):
+        import reservation_manager as rm
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {"Item": {"contract_id": "c1", "reservations": {}}}
+        with patch.object(rm, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            rm.release_reservation("c1", "nonexistent-res")
+        mock_table.update_item.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestThresholdAlerter
+# ---------------------------------------------------------------------------
+
+class TestThresholdAlerter(unittest.TestCase):
+    def _make_contract(self, consumed_pct: float = 0.0, alerts_sent=None):
+        allocated = 10000
+        consumed = int(allocated * consumed_pct)
+        remaining = allocated - consumed
+        return {
+            "contract_id": "c1",
+            "contract_name": "test-contract",
+            "status": "active",
+            "alert_thresholds": [70, 90],
+            "alerts_sent": alerts_sent if alerts_sent is not None else [],
+            "token_wallet": {
+                "input": {"allocated": allocated, "consumed": consumed, "reserved": 0, "remaining": remaining},
+                "output": {"allocated": allocated, "consumed": consumed, "reserved": 0, "remaining": remaining},
+            },
+        }
+
+    def test_below_threshold_no_sns_publish(self):
+        import threshold_alerter as ta
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {"Item": self._make_contract(consumed_pct=0.5)}
+        mock_sns = MagicMock()
+        with patch.object(ta, "get_dynamodb") as mock_ddb, \
+             patch.object(ta, "get_sns", return_value=mock_sns):
+            mock_ddb.return_value.Table.return_value = mock_table
+            ta.check_thresholds("c1")
+        mock_sns.publish.assert_not_called()
+
+    def test_at_70_percent_sends_alert(self):
+        import threshold_alerter as ta
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {"Item": self._make_contract(consumed_pct=0.75)}
+        mock_sns = MagicMock()
+        with patch.object(ta, "get_dynamodb") as mock_ddb, \
+             patch.object(ta, "get_sns", return_value=mock_sns), \
+             patch.object(ta, "ALERTS_TOPIC_ARN", "arn:aws:sns:us-east-1:123:test"):
+            mock_ddb.return_value.Table.return_value = mock_table
+            ta.check_thresholds("c1")
+        mock_sns.publish.assert_called()
+
+    def test_alert_deduplication_skips_if_already_sent(self):
+        import threshold_alerter as ta
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {"Item": self._make_contract(consumed_pct=0.75, alerts_sent=[70])}
+        mock_sns = MagicMock()
+        with patch.object(ta, "get_dynamodb") as mock_ddb, \
+             patch.object(ta, "get_sns", return_value=mock_sns), \
+             patch.object(ta, "ALERTS_TOPIC_ARN", "arn:aws:sns:us-east-1:123:test"):
+            mock_ddb.return_value.Table.return_value = mock_table
+            ta.check_thresholds("c1")
+        mock_sns.publish.assert_not_called()
+
+    def test_depleted_wallet_suspends_contract(self):
+        import threshold_alerter as ta
+        contract = self._make_contract(consumed_pct=1.0)
+        contract["token_wallet"]["input"]["remaining"] = 0
+        contract["token_wallet"]["output"]["remaining"] = 0
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {"Item": contract}
+        with patch.object(ta, "get_dynamodb") as mock_ddb, \
+             patch.object(ta, "get_sns", return_value=MagicMock()), \
+             patch.object(ta, "suspend_contract") as mock_suspend, \
+             patch.object(ta, "ALERTS_TOPIC_ARN", "arn:aws:sns:us-east-1:123:test"):
+            mock_ddb.return_value.Table.return_value = mock_table
+            ta.check_thresholds("c1")
+        mock_suspend.assert_called_once_with("c1")
+
+
+# ---------------------------------------------------------------------------
+# TestInvocationGateway
+# ---------------------------------------------------------------------------
+
+class TestInvocationGateway(unittest.TestCase):
+    def _make_event(self, **overrides):
+        base = {
+            "agent_id": "agent-123",
+            "input_text": "Hello world",
+            "session_id": "sess-1",
+            "max_expected_output_tokens": 500,
+        }
+        base.update(overrides)
+        return base
+
+    def _make_active_contract(self, inp_remaining=9000, out_remaining=9000):
+        return {
+            "contract_id": "contract-1",
+            "status": "active",
+            "token_wallet": {
+                "input": {"allocated": 10000, "consumed": 0, "reserved": 0, "remaining": inp_remaining},
+                "output": {"allocated": 10000, "consumed": 0, "reserved": 0, "remaining": out_remaining},
+            },
+        }
+
+    def _make_agent_item(self):
+        return {"agent_id": "agent-123", "bedrock_agent_id": "BID1", "contract_id": "contract-1"}
+
+    def _setup_ddb_tables(self, mock_ddb, agent_item, contract_item):
+        agent_table = MagicMock()
+        agent_table.get_item.return_value = {"Item": agent_item} if agent_item else {}
+        contract_table = MagicMock()
+        contract_table.get_item.return_value = {"Item": contract_item} if contract_item else {}
+        mock_ddb.return_value.Table.side_effect = lambda name: (
+            agent_table if "agent-registry" in name else contract_table
+        )
+        return agent_table, contract_table
+
+    def test_400_missing_required_fields(self):
+        import invocation_gateway as ig
+        result = ig.invocation_gateway_handler({}, None)
+        self.assertEqual(result["statusCode"], 400)
+
+    def test_404_agent_not_found(self):
+        import invocation_gateway as ig
+        with patch.object(ig, "get_dynamodb") as mock_ddb:
+            agent_table = MagicMock()
+            agent_table.get_item.return_value = {}
+            mock_ddb.return_value.Table.return_value = agent_table
+            result = ig.invocation_gateway_handler(self._make_event(), None)
+        self.assertEqual(result["statusCode"], 404)
+
+    def test_402_suspended_contract(self):
+        import invocation_gateway as ig
+        contract = self._make_active_contract()
+        contract["status"] = "suspended"
+        with patch.object(ig, "get_dynamodb") as mock_ddb:
+            self._setup_ddb_tables(mock_ddb, self._make_agent_item(), contract)
+            result = ig.invocation_gateway_handler(self._make_event(), None)
+        self.assertEqual(result["statusCode"], 402)
+
+    def test_402_insufficient_output_tokens(self):
+        import invocation_gateway as ig
+        contract = self._make_active_contract(out_remaining=10)
+        with patch.object(ig, "get_dynamodb") as mock_ddb:
+            self._setup_ddb_tables(mock_ddb, self._make_agent_item(), contract)
+            result = ig.invocation_gateway_handler(self._make_event(max_expected_output_tokens=500), None)
+        self.assertEqual(result["statusCode"], 402)
+
+    def test_402_concurrent_reservation_conflict(self):
+        import invocation_gateway as ig
+        import reservation_manager as rm
+        mock_rm_table = MagicMock()
+        mock_rm_table.update_item.side_effect = _client_error("ConditionalCheckFailedException")
+        with patch.object(ig, "get_dynamodb") as mock_ddb, \
+             patch.object(rm, "get_dynamodb") as mock_rm_ddb:
+            self._setup_ddb_tables(mock_ddb, self._make_agent_item(), self._make_active_contract())
+            mock_rm_ddb.return_value.Table.return_value = mock_rm_table
+            result = ig.invocation_gateway_handler(self._make_event(), None)
+        self.assertEqual(result["statusCode"], 402)
+
+    def test_500_bedrock_error_releases_reservation(self):
+        import invocation_gateway as ig
+        import reservation_manager as rm
+        mock_rm_table = MagicMock()
+        mock_rm_table.get_item.return_value = {
+            "Item": {"reservations": {"res-id": {"input_reserved": 3, "output_reserved": 500, "created_at": 0}}}
+        }
+        mock_bedrock = MagicMock()
+        mock_bedrock.invoke_agent.side_effect = _client_error("ValidationException")
+        with patch.object(ig, "get_dynamodb") as mock_ddb, \
+             patch.object(rm, "get_dynamodb") as mock_rm_ddb, \
+             patch.object(ig, "get_bedrock_agent_runtime", return_value=mock_bedrock):
+            self._setup_ddb_tables(mock_ddb, self._make_agent_item(), self._make_active_contract())
+            mock_rm_ddb.return_value.Table.return_value = mock_rm_table
+            result = ig.invocation_gateway_handler(self._make_event(), None)
+        self.assertEqual(result["statusCode"], 500)
+        mock_rm_table.update_item.assert_called()  # release_reservation called
+
+    def test_200_happy_path(self):
+        import invocation_gateway as ig
+        import reservation_manager as rm
+
+        mock_rm_table = MagicMock()
+        mock_rm_table.get_item.return_value = {
+            "Item": {"reservations": {"res-1": {"input_reserved": 3, "output_reserved": 500, "created_at": 0}}}
+        }
+
+        mock_chunk = {"chunk": {"bytes": b"Test response"}}
+        mock_stream = MagicMock()
+        mock_stream.__iter__ = MagicMock(return_value=iter([mock_chunk]))
+        mock_bedrock = MagicMock()
+        mock_bedrock.invoke_agent.return_value = {"completion": mock_stream}
+
+        # Wallet remaining after commit
+        contract_table_after = MagicMock()
+        contract_table_after.get_item.return_value = {
+            "Item": {
+                "token_wallet": {
+                    "input": {"remaining": 8997},
+                    "output": {"remaining": 8500},
+                }
+            }
+        }
+
+        with patch.object(ig, "get_dynamodb") as mock_ddb, \
+             patch.object(rm, "get_dynamodb") as mock_rm_ddb, \
+             patch.object(ig, "get_bedrock_agent_runtime", return_value=mock_bedrock), \
+             patch("threading.Thread") as mock_thread:
+            self._setup_ddb_tables(mock_ddb, self._make_agent_item(), self._make_active_contract())
+            mock_rm_ddb.return_value.Table.return_value = mock_rm_table
+            # Override get_wallet_remaining to use contract_table_after
+            with patch.object(ig, "get_wallet_remaining", return_value={"input_remaining": 8997, "output_remaining": 8500}):
+                result = ig.invocation_gateway_handler(self._make_event(), None)
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn("usage", result)
+        self.assertIn("wallet_remaining", result)
+
+
+# ---------------------------------------------------------------------------
+# TestReservationCleanup
+# ---------------------------------------------------------------------------
+
+class TestReservationCleanup(unittest.TestCase):
+    def test_stale_reservation_is_released(self):
+        import reservation_cleanup as rc
+        import reservation_manager as rm
+
+        stale_time = int(time.time()) - 400  # older than 300s
+        mock_contracts_table = MagicMock()
+        mock_contracts_table.scan.return_value = {
+            "Items": [{
+                "contract_id": "c1",
+                "reservations": {
+                    "res-old": {"input_reserved": 10, "output_reserved": 20, "created_at": stale_time}
+                },
+            }]
+        }
+        mock_rm_table = MagicMock()
+        mock_rm_table.get_item.return_value = {
+            "Item": {"reservations": {"res-old": {"input_reserved": 10, "output_reserved": 20}}}
+        }
+        with patch.object(rc, "get_dynamodb") as mock_ddb, \
+             patch.object(rm, "get_dynamodb") as mock_rm_ddb:
+            mock_ddb.return_value.Table.return_value = mock_contracts_table
+            mock_rm_ddb.return_value.Table.return_value = mock_rm_table
+            result = rc.reservation_cleanup_handler({}, None)
+        self.assertGreater(result["cleaned_count"], 0)
+        mock_rm_table.update_item.assert_called()
+
+    def test_fresh_reservation_not_released(self):
+        import reservation_cleanup as rc
+
+        fresh_time = int(time.time()) - 60  # only 60s old
+        mock_contracts_table = MagicMock()
+        mock_contracts_table.scan.return_value = {
+            "Items": [{
+                "contract_id": "c1",
+                "reservations": {
+                    "res-new": {"input_reserved": 10, "output_reserved": 20, "created_at": fresh_time}
+                },
+            }]
+        }
+        with patch.object(rc, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_contracts_table
+            result = rc.reservation_cleanup_handler({}, None)
+        self.assertEqual(result["cleaned_count"], 0)
+
+    def test_no_contracts_with_reservations(self):
+        import reservation_cleanup as rc
+
+        mock_contracts_table = MagicMock()
+        mock_contracts_table.scan.return_value = {"Items": []}
+        with patch.object(rc, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_contracts_table
+            result = rc.reservation_cleanup_handler({}, None)
+        self.assertEqual(result["cleaned_count"], 0)
+
+
+# ---------------------------------------------------------------------------
+# TestOrphanReconciliation
+# ---------------------------------------------------------------------------
+
+class TestOrphanReconciliation(unittest.TestCase):
+    def test_bedrock_orphan_deleted(self):
+        import orphan_reconciliation as orec
+
+        mock_bedrock = MagicMock()
+        mock_bedrock.list_agents.return_value = {"agentSummaries": [{"agentId": "BID-orphan"}]}
+        mock_table = MagicMock()
+        mock_table.scan.return_value = {"Items": []}
+
+        with patch.object(orec, "get_bedrock_agents", return_value=mock_bedrock), \
+             patch.object(orec, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            result = orec.orphan_reconciliation_handler({}, None)
+
+        mock_bedrock.delete_agent.assert_called_once_with(agentId="BID-orphan", skipResourceInUseCheck=True)
+        self.assertEqual(result["bedrock_orphans_deleted"], 1)
+
+    def test_dynamo_stale_record_deleted(self):
+        import orphan_reconciliation as orec
+
+        mock_bedrock = MagicMock()
+        mock_bedrock.list_agents.return_value = {"agentSummaries": []}
+        mock_table = MagicMock()
+        mock_table.scan.return_value = {
+            "Items": [{"agent_id": "a1", "bedrock_agent_id": "BID-gone"}]
+        }
+
+        with patch.object(orec, "get_bedrock_agents", return_value=mock_bedrock), \
+             patch.object(orec, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            result = orec.orphan_reconciliation_handler({}, None)
+
+        mock_table.delete_item.assert_called_once_with(Key={"agent_id": "a1"})
+        self.assertEqual(result["dynamo_stale_records_deleted"], 1)
+
+    def test_healthy_agents_not_touched(self):
+        import orphan_reconciliation as orec
+
+        mock_bedrock = MagicMock()
+        mock_bedrock.list_agents.return_value = {"agentSummaries": [{"agentId": "BID1"}]}
+        mock_table = MagicMock()
+        mock_table.scan.return_value = {
+            "Items": [{"agent_id": "a1", "bedrock_agent_id": "BID1"}]
+        }
+
+        with patch.object(orec, "get_bedrock_agents", return_value=mock_bedrock), \
+             patch.object(orec, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            result = orec.orphan_reconciliation_handler({}, None)
+
+        mock_bedrock.delete_agent.assert_not_called()
+        mock_table.delete_item.assert_not_called()
+        self.assertEqual(result["bedrock_orphans_deleted"], 0)
+        self.assertEqual(result["dynamo_stale_records_deleted"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
