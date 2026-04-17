@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: DeployWeave - Modular MCP Tool Suite for AWS Bedrock (pay-per-request)
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 300
+    MemorySize: 256
+    Environment:
+      Variables:
+        AWS_REGION: !Ref AWS::Region
+        AGENT_TABLE: !Ref AgentRegistryTable
+        ADAPTER_TABLE: !Ref AdapterCatalogTable
+        METRICS_TABLE: !Ref ModelMetricsTable
+        CLEANUP_QUEUE_URL: !Ref CleanupQueue
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # DynamoDB Tables
+  # ----------------------------------------------------------
+
+  AdapterCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: deployweave-adapter-catalog
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: adapter_id
+          AttributeType: S
+        - AttributeName: base_model
+          AttributeType: S
+        - AttributeName: task_type
+          AttributeType: S
+        - AttributeName: primary_tag
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: adapter_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: base_model-index
+          KeySchema:
+            - AttributeName: base_model
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: task_type-index
+          KeySchema:
+            - AttributeName: task_type
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: primary_tag-index
+          KeySchema:
+            - AttributeName: primary_tag
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ModelMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: deployweave-model-metrics
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: model_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: model_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  AgentRegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: deployweave-agent-registry
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: agent_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: agent_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        # OLD_IMAGE captures the deleted item's data (agent IDs) for cleanup
+        StreamViewType: OLD_IMAGE
+      GlobalSecondaryIndexes:
+        - IndexName: status-created_at-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ----------------------------------------------------------
+  # SQS Queues
+  # ----------------------------------------------------------
+
+  CleanupDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: deployweave-cleanup-dlq
+      MessageRetentionPeriod: 1209600  # 14 days for investigation
+
+  CleanupQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: deployweave-cleanup-queue
+      # VisibilityTimeout must be >= 6x Lambda timeout (300s)
+      VisibilityTimeout: 1800
+      MessageRetentionPeriod: 86400  # 24 hours
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CleanupDLQ.Arn
+        maxReceiveCount: 3
+
+  # ----------------------------------------------------------
+  # IAM Role
+  # ----------------------------------------------------------
+
+  DeployWeaveLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub deployweave-lambda-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeployWeavePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BedrockAccess
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:CreateAgent
+                  - bedrock:DeleteAgent
+                  - bedrock:GetAgent
+                  - bedrock:ListAgents
+                  - bedrock:PrepareAgent
+                Resource: "*"
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  - !GetAtt AdapterCatalogTable.Arn
+                  - !Sub "${AdapterCatalogTable.Arn}/index/*"
+                  - !GetAtt ModelMetricsTable.Arn
+                  - !GetAtt AgentRegistryTable.Arn
+                  - !Sub "${AgentRegistryTable.Arn}/index/*"
+                  - !GetAtt AgentRegistryTable.StreamArn
+              - Sid: SQSAccess
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !GetAtt CleanupQueue.Arn
+                  - !GetAtt CleanupDLQ.Arn
+
+  # ----------------------------------------------------------
+  # Lambda Functions
+  # ----------------------------------------------------------
+
+  CleanupLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub deployweave-cleanup-${Environment}
+      CodeUri: .
+      Handler: cleanup_lambda.lambda_handler
+      Role: !GetAtt DeployWeaveLambdaRole.Arn
+      Description: >
+        Cleans up individual expired Bedrock agents.
+        Triggered by SQS messages from deployweave-cleanup-queue (pay-per-request).
+      Events:
+        SQSCleanupTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt CleanupQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  StreamsToSQSFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub deployweave-streams-bridge-${Environment}
+      CodeUri: .
+      Handler: streams_to_sqs.lambda_handler
+      Role: !GetAtt DeployWeaveLambdaRole.Arn
+      Timeout: 60
+      Description: >
+        Bridges DynamoDB Streams REMOVE events to SQS cleanup queue.
+        Triggered on TTL expiry or explicit agent deletion.
+      Events:
+        AgentRegistryStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AgentRegistryTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 5
+            # Split batch on error to isolate poisoned records
+            BisectBatchOnFunctionError: true
+            # Filter to REMOVE events only at the Lambda service level
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName": ["REMOVE"]}'
+
+  # ----------------------------------------------------------
+  # CloudWatch Alarms
+  # ----------------------------------------------------------
+
+  CleanupDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub deployweave-cleanup-dlq-messages-${Environment}
+      AlarmDescription: >
+        Cleanup Lambda failed to process messages 3+ times.
+        Manual investigation required for failed agent deletions.
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt CleanupDLQ.QueueName
+
+  CleanupLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub deployweave-cleanup-lambda-errors-${Environment}
+      AlarmDescription: Cleanup Lambda is throwing unexpected errors.
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CleanupLambdaFunction
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  AgentRegistryTableName:
+    Description: DynamoDB table tracking provisioned agents
+    Value: !Ref AgentRegistryTable
+    Export:
+      Name: !Sub deployweave-agent-registry-table-${Environment}
+
+  AgentRegistryStreamArn:
+    Description: DynamoDB Stream ARN for agent registry (feeds cleanup pipeline)
+    Value: !GetAtt AgentRegistryTable.StreamArn
+    Export:
+      Name: !Sub deployweave-agent-registry-stream-${Environment}
+
+  AdapterCatalogTableName:
+    Description: DynamoDB table for LoRA adapter catalog
+    Value: !Ref AdapterCatalogTable
+    Export:
+      Name: !Sub deployweave-adapter-catalog-table-${Environment}
+
+  ModelMetricsTableName:
+    Description: DynamoDB table for A/B model metrics
+    Value: !Ref ModelMetricsTable
+    Export:
+      Name: !Sub deployweave-model-metrics-table-${Environment}
+
+  CleanupQueueUrl:
+    Description: SQS URL for the agent cleanup queue
+    Value: !Ref CleanupQueue
+    Export:
+      Name: !Sub deployweave-cleanup-queue-url-${Environment}
+
+  CleanupDLQUrl:
+    Description: SQS URL for the cleanup dead-letter queue
+    Value: !Ref CleanupDLQ
+    Export:
+      Name: !Sub deployweave-cleanup-dlq-url-${Environment}
+
+  CleanupLambdaArn:
+    Description: ARN of the cleanup Lambda function
+    Value: !GetAtt CleanupLambdaFunction.Arn
+    Export:
+      Name: !Sub deployweave-cleanup-lambda-arn-${Environment}
+
+  StreamsBridgeLambdaArn:
+    Description: ARN of the DynamoDB Streams bridge Lambda function
+    Value: !GetAtt StreamsToSQSFunction.Arn
+    Export:
+      Name: !Sub deployweave-streams-bridge-lambda-arn-${Environment}
