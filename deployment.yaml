@@ -123,6 +123,18 @@ Resources:
           Projection:
             ProjectionType: ALL
 
+  ContractsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: deployweave-contracts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: contract_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: contract_id
+          KeyType: HASH
+
   # ----------------------------------------------------------
   # SQS Queues
   # ----------------------------------------------------------
@@ -143,6 +155,16 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt CleanupDLQ.Arn
         maxReceiveCount: 3
+
+  # ----------------------------------------------------------
+  # SNS Topic for threshold alerts
+  # ----------------------------------------------------------
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub deployweave-alerts-${Environment}
+      DisplayName: DeployWeave Token Threshold Alerts
 
   # ----------------------------------------------------------
   # IAM Role
@@ -170,6 +192,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - bedrock:InvokeModel
+                  - bedrock:InvokeAgent
                   - bedrock:CreateAgent
                   - bedrock:DeleteAgent
                   - bedrock:GetAgent
@@ -198,6 +221,12 @@ Resources:
                   - !GetAtt AgentRegistryTable.Arn
                   - !Sub "${AgentRegistryTable.Arn}/index/*"
                   - !GetAtt AgentRegistryTable.StreamArn
+                  - !GetAtt ContractsTable.Arn
+              - Sid: SNSAccess
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertsTopic
               - Sid: SQSAccess
                 Effect: Allow
                 Action:
@@ -259,6 +288,72 @@ Resources:
             FilterCriteria:
               Filters:
                 - Pattern: '{"eventName": ["REMOVE"]}'
+
+  InvocationGatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub deployweave-invocation-gateway-${Environment}
+      CodeUri: .
+      Handler: invocation_gateway.invocation_gateway_handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt DeployWeaveLambdaRole.Arn
+      Environment:
+        Variables:
+          CONTRACT_TABLE: !Ref ContractsTable
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+      Description: >
+        Real-time token enforcement gateway for Bedrock agent invocations.
+        Validates wallet, reserves tokens, invokes Bedrock, commits actual usage.
+      Events:
+        InvokeAPI:
+          Type: Api
+          Properties:
+            Path: /invoke
+            Method: POST
+
+  ReservationCleanupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub deployweave-reservation-cleanup-${Environment}
+      CodeUri: .
+      Handler: reservation_cleanup.reservation_cleanup_handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt DeployWeaveLambdaRole.Arn
+      Environment:
+        Variables:
+          CONTRACT_TABLE: !Ref ContractsTable
+      Description: >
+        Releases token reservations older than 5 minutes (stuck due to Lambda timeout).
+      Events:
+        CleanupSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Clean up stale token reservations
+
+  OrphanReconciliationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub deployweave-orphan-reconciliation-${Environment}
+      CodeUri: .
+      Handler: orphan_reconciliation.orphan_reconciliation_handler
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt DeployWeaveLambdaRole.Arn
+      Description: >
+        Hourly sweep that reconciles Bedrock agents against DynamoDB records,
+        cleaning up orphaned agents and stale registry entries.
+      Events:
+        ReconcileSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Reconcile orphaned Bedrock agents
 
   # ----------------------------------------------------------
   # CloudWatch Alarms
@@ -351,3 +446,39 @@ Outputs:
     Value: !GetAtt StreamsToSQSFunction.Arn
     Export:
       Name: !Sub deployweave-streams-bridge-lambda-arn-${Environment}
+
+  ContractsTableName:
+    Description: DynamoDB table for token contracts and wallets
+    Value: !Ref ContractsTable
+    Export:
+      Name: !Sub deployweave-contracts-table-${Environment}
+
+  AlertsTopicArn:
+    Description: SNS topic ARN for token threshold alerts
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub deployweave-alerts-topic-arn-${Environment}
+
+  InvocationGatewayApiUrl:
+    Description: API Gateway endpoint for Bedrock agent invocation
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/invoke"
+    Export:
+      Name: !Sub deployweave-invocation-gateway-url-${Environment}
+
+  InvocationGatewayArn:
+    Description: ARN of the invocation gateway Lambda
+    Value: !GetAtt InvocationGatewayFunction.Arn
+    Export:
+      Name: !Sub deployweave-invocation-gateway-arn-${Environment}
+
+  ReservationCleanupArn:
+    Description: ARN of the reservation cleanup Lambda
+    Value: !GetAtt ReservationCleanupFunction.Arn
+    Export:
+      Name: !Sub deployweave-reservation-cleanup-arn-${Environment}
+
+  OrphanReconciliationArn:
+    Description: ARN of the orphan reconciliation Lambda
+    Value: !GetAtt OrphanReconciliationFunction.Arn
+    Export:
+      Name: !Sub deployweave-orphan-reconciliation-arn-${Environment}
