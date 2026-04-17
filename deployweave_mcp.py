@@ -11,6 +11,8 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 from fastmcp import FastMCP
 
+from lora_validator import validate_lora_compatibility
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -201,36 +203,45 @@ def _provision_single_agent(
     spec: dict,
     ttl_hours: int,
     use_lora: bool,
+    contract_id: Optional[str] = None,
 ) -> dict:
     name = spec.get("name", f"agent-{uuid.uuid4().hex[:8]}")
     system_prompt = spec.get("system_prompt", "")
     model = spec.get("model", MODEL_SONNET)
     capabilities = spec.get("capabilities", [])
 
+    now = int(time.time())
+    ttl = now + ttl_hours * 3600
+
     lora_applied = False
     if use_lora:
-        # Best-effort adapter lookup; failure is non-fatal
         try:
             task_type = capabilities[0] if capabilities else "general"
             adapter_result = _search_adapters_by_task(task_type, model)
+            lora_adapter_id = adapter_result[0]["adapter_id"] if adapter_result else None
+            validate_lora_compatibility(model, lora_adapter_id)
             lora_applied = bool(adapter_result)
+        except ValueError as lora_err:
+            logger.warning("LoRA not compatible: %s; continuing without adapter", lora_err)
         except Exception:
             logger.warning("LoRA adapter lookup failed; continuing without adapter")
+
+    tags = {"created_by": "deployweave", "ttl": str(ttl)}
+    if contract_id:
+        tags["contract_id"] = contract_id
 
     bedrock_resp = get_bedrock_agents().create_agent(
         agentName=f"deployweave-{name}-{uuid.uuid4().hex[:6]}",
         foundationModel=model,
         description=f"DeployWeave provisioned agent: {name}",
         instruction=system_prompt,
+        tags=tags,
     )
     agent_info = bedrock_resp["agent"]
     bedrock_agent_id = agent_info["agentId"]
     bedrock_agent_arn = agent_info["agentArn"]
 
-    now = int(time.time())
-    ttl = now + ttl_hours * 3600
     agent_id = f"agent-{uuid.uuid4()}"
-
     item = {
         "agent_id": agent_id,
         "bedrock_agent_id": bedrock_agent_id,
@@ -246,7 +257,19 @@ def _provision_single_agent(
         "ttl": ttl,
         "expiry_timestamp": ttl,
     }
-    get_dynamodb().Table(AGENT_TABLE).put_item(Item=item)
+    if contract_id:
+        item["contract_id"] = contract_id
+
+    # Transactional: if DynamoDB write fails, roll back the Bedrock agent
+    try:
+        get_dynamodb().Table(AGENT_TABLE).put_item(Item=item)
+    except Exception as ddb_err:
+        logger.error("DynamoDB write failed for %s; rolling back Bedrock agent: %s", bedrock_agent_id, ddb_err)
+        try:
+            get_bedrock_agents().delete_agent(agentId=bedrock_agent_id, skipResourceInUseCheck=True)
+        except ClientError as rollback_err:
+            logger.warning("Bedrock rollback of %s failed: %s", bedrock_agent_id, rollback_err)
+        raise
 
     return {
         "agent_id": agent_id,
@@ -276,6 +299,7 @@ async def team_provisioner(
     agent_specs: list,
     ttl_hours: int = DEFAULT_TTL_HOURS,
     use_lora: bool = False,
+    contract_id: Optional[str] = None,
 ) -> dict:
     """Provision a set of Bedrock agents from caller-provided specs and store them with a TTL."""
     if not agent_specs:
@@ -287,7 +311,7 @@ async def team_provisioner(
 
     try:
         for spec in specs:
-            result = _provision_single_agent(spec, ttl_hours, use_lora)
+            result = _provision_single_agent(spec, ttl_hours, use_lora, contract_id=contract_id)
             provisioned.append(result)
             created_bedrock_ids.append(result["bedrock_agent_id"])
     except Exception as exc:
