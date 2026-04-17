@@ -1,36 +1,54 @@
 # DeployWeave
 
-Modular MCP tool suite for dynamic model selection, agent provisioning, LoRA adapter management, and lifecycle management on AWS Bedrock. DeployWeave handles **deployment concerns only** — orchestration and execution logic lives in a separate layer (TeamWeave).
+Modular MCP tool suite for dynamic model selection, Bedrock agent provisioning, LoRA adapter management, and real-time token enforcement on AWS Bedrock. DeployWeave handles **deployment concerns only** — orchestration and execution logic lives in a separate layer (TeamWeave).
 
-## Architecture
+## Overview
 
 ```
-MCP Client
-    │
-    ▼
+MCP Client (Claude / TeamWeave)
+        │
+        ▼
 deployweave_mcp.py  (FastMCP server — 4 tools)
-    ├── model_selector      ──► DynamoDB: deployweave-model-metrics
-    ├── team_provisioner    ──► Bedrock Agents (create_agent)
-    │                           DynamoDB: deployweave-agent-registry (TTL)
-    ├── adapter_resolver    ──► DynamoDB: deployweave-adapter-catalog
-    └── agent_lifecycle     ──► Bedrock Agents + DynamoDB agent-registry
-                                        │
-                               TTL expiry / explicit delete
-                                        ▼
-                           DynamoDB Streams (OLD_IMAGE)
-                                        ▼
-                           streams_to_sqs.py  (Lambda bridge)
-                                        ▼
-                           SQS: deployweave-cleanup-queue
-                                        ▼
-                           cleanup_lambda.py  (pay-per-request)
-                             ├── bedrock_agents.delete_agent()
-                             └── dynamodb.delete_item()
-                                        ▼ (on 3 failures)
-                           SQS: deployweave-cleanup-dlq
+        ├── model_selector        ──► DynamoDB: model-metrics
+        ├── team_provisioner      ──► Bedrock Agents + DynamoDB: agent-registry
+        ├── adapter_resolver      ──► DynamoDB: adapter-catalog
+        └── agent_lifecycle       ──► Bedrock Agents + DynamoDB: agent-registry
+
+REST Callers (HTTP)
+        │
+        ▼  POST /invoke
+invocation_gateway.py  (Lambda + API Gateway)
+        ├── Pre-check  ──► DynamoDB: contracts (wallet remaining)
+        ├── Reserve    ──► Conditional update (reservation pattern)
+        ├── Invoke     ──► Bedrock Agent Runtime
+        ├── Commit     ──► Deduct actual tokens, release reservation
+        └── Alert      ──► threshold_alerter → SNS topic
+
+Background Schedules
+        ├── reservation_cleanup.py   (every 5 min)  ──► release stuck reservations
+        └── orphan_reconciliation.py (every 1 hour) ──► sync Bedrock ↔ DynamoDB
+
+TTL Cleanup Pipeline
+        DynamoDB TTL expiry
+            ▼
+        DynamoDB Streams (OLD_IMAGE)
+            ▼
+        streams_to_sqs.py  (Lambda bridge)
+            ▼
+        SQS: deployweave-cleanup-queue
+            ▼
+        cleanup_lambda.py
+            ├── bedrock_agents.delete_agent()
+            └── dynamodb.delete_item()
+                    ▼ (on 3 failures)
+        SQS: deployweave-cleanup-dlq
 ```
 
-## Tools
+See [docs/architecture.md](docs/architecture.md) for the full architecture deep-dive.
+
+---
+
+## MCP Tools
 
 ### `model_selector`
 
@@ -47,8 +65,6 @@ Selects the optimal Bedrock model based on latency budget and A/B testing mode.
 ```json
 {
   "selected_model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
-  "primary_model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
-  "secondary_model": null,
   "reasoning": "Highest composite score (0.871) across recent reasoning runs",
   "ab_mode": "winner",
   "estimated_cost_usd": 0.0000123
@@ -57,27 +73,25 @@ Selects the optimal Bedrock model based on latency budget and A/B testing mode.
 
 ### `team_provisioner`
 
-Provisions multiple Bedrock agents from caller-provided specs in a single call (max 5).
+Provisions up to 5 Bedrock agents in a single transactional call. If any agent fails, all previously created agents in the batch are rolled back from Bedrock.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `agent_specs` | list | Array of `{name, system_prompt, model, capabilities}` |
+| `agent_specs` | list | `[{name, system_prompt, model, capabilities}]` |
 | `ttl_hours` | int | Agent TTL in hours (default 72) |
-| `use_lora` | bool | Search adapter catalog and apply matching LoRA adapter |
+| `use_lora` | bool | Look up and apply a matching LoRA adapter |
+| `contract_id` | string | Optional contract to link agents to (stored as tag + DDB field) |
 
-Automatically rolls back all created agents if any provisioning call fails.
+LoRA adapters are only applied when the model is LoRA-compatible (Titan and Llama families). Claude/Nova models raise a `ValueError` at provisioning time.
 
 ```json
 {
   "provisioned_agents": [
     {
       "agent_id": "agent-3f2a...",
-      "name": "intake_agent",
       "bedrock_agent_id": "ABCDE12345",
-      "bedrock_agent_arn": "arn:aws:bedrock:us-east-1:123456789:agent/ABCDE12345",
       "model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
       "lora_applied": false,
-      "created_at": "2026-04-17T14:30:00+00:00",
       "expires_at": "2026-04-20T14:30:00+00:00"
     }
   ],
@@ -92,10 +106,10 @@ Manages the LoRA adapter catalog in DynamoDB.
 
 | `operation` | Required params | Description |
 |---|---|---|
-| `list_adapters` | — | List all adapters; optionally filter by `task_type` or `base_model` |
-| `get_adapter` | `adapter_id` | Fetch a single adapter by ID |
+| `list_adapters` | — | List all adapters; filter by `task_type` or `base_model` |
+| `get_adapter` | `adapter_id` | Fetch a single adapter |
 | `register_adapter` | `adapter_metadata` | Add adapter with `base_model`, `s3_path`, `tags` |
-| `search_by_tags` | `tags` | Search by tag list (primary tag uses GSI; extras filtered client-side) |
+| `search_by_tags` | `tags` | Tag-based search (primary tag uses GSI; extras filtered client-side) |
 
 ### `agent_lifecycle`
 
@@ -105,14 +119,87 @@ Manages an individual Bedrock agent's full lifecycle.
 |---|---|---|
 | `provision` | `agent_name`, `system_prompt` | Create single agent + store with TTL |
 | `list_agents` | — | List all agents with active/expired classification |
-| `get_agent` | `agent_id` | Fetch agent details; checks expiry client-side |
-| `delete_agent` | `agent_id` | Delete from Bedrock + DynamoDB (triggers async Streams cleanup) |
-| `extend_ttl` | `agent_id`, `ttl_hours` | Push expiry forward by `ttl_hours` |
+| `get_agent` | `agent_id` | Fetch agent details |
+| `delete_agent` | `agent_id` | Synchronous delete from Bedrock + DynamoDB |
+| `extend_ttl` | `agent_id`, `ttl_hours` | Push expiry forward |
+
+---
+
+## Token Enforcement (POST /invoke)
+
+All Bedrock invocations for contract-linked agents must go through the `invocation_gateway` Lambda. This prevents overspend by validating the token wallet before invoking Bedrock and deducting actual usage atomically after.
+
+### Request
+
+```
+POST https://<api-id>.execute-api.<region>.amazonaws.com/Prod/invoke
+Content-Type: application/json
+
+{
+  "agent_id":                   "agent-intake-uuid",
+  "input_text":                 "User query here",
+  "session_id":                 "session-uuid",
+  "max_expected_output_tokens": 500
+}
+```
+
+### Response (200)
+
+```json
+{
+  "statusCode": 200,
+  "body": "<agent completion text>",
+  "usage": {
+    "input_tokens": 42,
+    "output_tokens": 138,
+    "cached_input_tokens": 0,
+    "cost_usd": 0.00000231
+  },
+  "wallet_remaining": {
+    "input_remaining": 952228,
+    "output_remaining": 486412
+  }
+}
+```
+
+### Error codes
+
+| Code | Meaning |
+|---|---|
+| `400` | Missing required fields or agent has no contract |
+| `402` | Insufficient tokens, suspended contract, or concurrent reservation conflict |
+| `404` | Agent or contract not found |
+| `500` | Bedrock invocation error (reservation is released automatically) |
+
+### Reservation pattern
+
+Concurrent invocations on the same contract are safe:
+
+1. **Reserve** — atomic conditional update; fails if `remaining < required`
+2. **Invoke** — Bedrock call happens after reservation is held
+3. **Commit** — deducts actual usage; refunds over-reservation back to `remaining`
+4. **Release** — called instead of commit on any Bedrock error
+
+Reservations older than 5 minutes are swept by `reservation_cleanup.py`.
+
+---
+
+## Threshold Alerts
+
+The threshold alerter fires once per threshold level per contract, publishing to the SNS topic `deployweave-alerts-<env>`. Subscribe any endpoint (email, Lambda, SQS, PagerDuty) to the SNS topic from the AWS console.
+
+| Threshold | Default | Behaviour |
+|---|---|---|
+| 70% | Configurable per contract | SNS alert published once |
+| 90% | Configurable per contract | SNS alert published once |
+| 100% (depletion) | — | Contract auto-suspended; all subsequent invocations return 402 |
+
+---
 
 ## Prerequisites
 
-- Python 3.9+
-- AWS CLI configured with Bedrock access in `us-east-1`
+- Python 3.11+
+- AWS CLI configured with Bedrock access
 - AWS SAM CLI (`pip install aws-sam-cli`)
 - Bedrock model access enabled for Claude Haiku, Sonnet, and Opus
 
@@ -129,7 +216,7 @@ sam build
 sam deploy --guided
 ```
 
-Follow the prompts. Key parameters:
+Key parameters:
 - **Stack Name**: `deployweave-dev`
 - **AWS Region**: `us-east-1`
 - **Environment**: `dev` / `staging` / `prod`
@@ -159,49 +246,57 @@ Or add to Claude Code MCP settings:
 python -m pytest unit_tests.py -v
 ```
 
-All tests mock AWS calls — no live credentials required.
+All 85 tests mock AWS calls — no live credentials required.
+
+---
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `AWS_REGION` | `us-east-1` | AWS region for all services |
-| `AGENT_TABLE` | `deployweave-agent-registry` | DynamoDB table for provisioned agents |
-| `ADAPTER_TABLE` | `deployweave-adapter-catalog` | DynamoDB table for LoRA adapters |
-| `METRICS_TABLE` | `deployweave-model-metrics` | DynamoDB table for A/B metrics |
-| `CLEANUP_QUEUE_URL` | — | SQS URL for cleanup queue (set by SAM) |
+| `AGENT_TABLE` | `deployweave-agent-registry` | DynamoDB agent registry |
+| `ADAPTER_TABLE` | `deployweave-adapter-catalog` | DynamoDB adapter catalog |
+| `METRICS_TABLE` | `deployweave-model-metrics` | DynamoDB A/B metrics |
+| `CLEANUP_QUEUE_URL` | — | SQS cleanup queue URL (set by SAM) |
+| `CONTRACT_TABLE` | `deployweave-contracts` | DynamoDB contract + wallet table |
+| `ALERTS_TOPIC_ARN` | — | SNS topic ARN for threshold alerts (set by SAM) |
 
 ## DynamoDB Tables
 
-| Table | Billing | TTL | Streams |
-|---|---|---|---|
-| `deployweave-agent-registry` | PAY_PER_REQUEST | `ttl` attribute | OLD_IMAGE |
-| `deployweave-adapter-catalog` | PAY_PER_REQUEST | — | — |
-| `deployweave-model-metrics` | PAY_PER_REQUEST | — | — |
+| Table | Billing | TTL | Streams | Purpose |
+|---|---|---|---|---|
+| `deployweave-agent-registry` | PAY_PER_REQUEST | `ttl` | OLD_IMAGE | Provisioned agents |
+| `deployweave-adapter-catalog` | PAY_PER_REQUEST | — | — | LoRA adapter catalog |
+| `deployweave-model-metrics` | PAY_PER_REQUEST | — | — | A/B testing metrics |
+| `deployweave-contracts` | PAY_PER_REQUEST | — | — | Token wallets + reservations |
 
-## Cleanup Pipeline
+## Lambda Functions
 
-Agents are automatically cleaned up when their TTL expires:
+| Function | Trigger | Purpose |
+|---|---|---|
+| `deployweave-cleanup` | SQS | Delete expired Bedrock agents |
+| `deployweave-streams-bridge` | DynamoDB Streams | Bridge TTL events → SQS |
+| `deployweave-invocation-gateway` | API Gateway POST /invoke | Token enforcement + Bedrock invoke |
+| `deployweave-reservation-cleanup` | EventBridge (5 min) | Release stuck reservations |
+| `deployweave-orphan-reconciliation` | EventBridge (1 hour) | Reconcile Bedrock ↔ DynamoDB |
 
-1. DynamoDB TTL removes the item → fires a `REMOVE` stream event
-2. `streams_to_sqs.py` reads the `OldImage` and enqueues `{agent_id, bedrock_agent_id}` to SQS
-3. `cleanup_lambda.py` deletes the Bedrock agent then the DynamoDB record
-4. On 3 consecutive failures: message routes to the DLQ for manual review
-
-Explicit deletion via `agent_lifecycle(operation="delete_agent")` deletes synchronously; the stream event becomes a no-op.
-
-## Cost Estimation (Light Usage)
+## Cost Estimation
 
 | Service | Estimate | Notes |
 |---|---|---|
-| DynamoDB | ~$1–3/month | ~10k reads + 1k writes/day |
-| Lambda (cleanup + bridge) | ~$0.02/month | Invoked only on TTL expiry |
+| DynamoDB | ~$2–5/month | 4 tables, pay-per-request |
+| Lambda (all functions) | ~$0.05–0.50/month | Scales with invocation volume |
+| API Gateway | ~$3.50/million requests | First 1M/month free on free tier |
 | SQS | Free tier | First 1M requests/month free |
-| Bedrock (Sonnet) | ~$0.003/1k input tokens | Per provisioning call |
-| **Total** | **~$5–15/month** | Scales linearly with agent volume |
+| SNS | ~$0.50/million publishes | First 1M/month free |
+| Bedrock | Variable | Billed per actual token usage |
+| **Fixed overhead** | **~$5–10/month** | Excluding Bedrock usage |
 
 ## Security
 
-- IAM role uses least-privilege: Bedrock actions scoped to specific operations, DynamoDB scoped to DeployWeave tables only
+- IAM role uses least-privilege: Bedrock actions scoped to specific operations, DynamoDB scoped to DeployWeave tables, SNS scoped to the alerts topic
 - No credentials in code; all config via environment variables
-- DynamoDB Streams + SQS decoupling isolates cleanup failures with automatic retry and DLQ
+- DynamoDB conditional updates prevent race conditions on token wallet modifications
+- Reservation pattern ensures atomic pre-allocation before any Bedrock call is made
+- Alert deduplication prevents SNS spam under concurrent invocations
