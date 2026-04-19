@@ -63,7 +63,7 @@ jobs:
           role-session-name: deployweave-${{ env.TARGET_ENV }}-${{ github.run_id }}
 
       - name: SAM Build
-        run: sam build --use-container
+        run: sam build --use-container --template deployment.yaml
 
       - name: SAM Deploy
         run: |
