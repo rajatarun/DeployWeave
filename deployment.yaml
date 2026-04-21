@@ -9,7 +9,6 @@ Globals:
     MemorySize: 256
     Environment:
       Variables:
-        AWS_REGION: !Ref AWS::Region
         AGENT_TABLE: !Ref AgentRegistryTable
         ADAPTER_TABLE: !Ref AdapterCatalogTable
         METRICS_TABLE: !Ref ModelMetricsTable
