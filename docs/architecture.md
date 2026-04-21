@@ -13,7 +13,8 @@
 9. [DynamoDB Schemas](#dynamodb-schemas)
 10. [Infrastructure (SAM)](#infrastructure-sam)
 11. [IAM Permissions](#iam-permissions)
-12. [Data Flow Diagrams](#data-flow-diagrams)
+12. [CI/CD Pipeline](#cicd-pipeline)
+13. [Data Flow Diagrams](#data-flow-diagrams)
 
 ---
 
@@ -549,6 +550,66 @@ All Lambda functions share `DeployWeaveLambdaRole`.
 | _(managed)_ | `AWSLambdaBasicExecutionRole` | CloudWatch Logs |
 
 > **`bedrock:InvokeAgent`** requires the `bedrock-agent-runtime` API endpoint (distinct from `bedrock-agent` used for management). Both are covered under `Resource: "*"` for v1. In production, scope `InvokeAgent` to specific agent ARNs.
+
+---
+
+## CI/CD Pipeline
+
+**Workflows:** `.github/workflows/deploy.yml` (production + manual), `.github/workflows/sandbox.yml` (feature branches)
+
+### Authentication
+
+All workflows authenticate to AWS using OIDC via `aws-actions/configure-aws-credentials`. No long-lived access keys are stored in GitHub. The assumed role is `arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer`.
+
+### `deploy.yml` — Production and manual deploys
+
+```
+push to main  ──or──  workflow_dispatch (env: sandbox|dev|staging|prod)
+        │
+        ▼
+  [test job]
+  ├── actions/setup-python@v5 (Python 3.11)
+  ├── pip install -r requirements.txt pytest
+  └── python -m pytest unit_tests.py -v
+        │
+        ▼ (needs: test)
+  [deploy job]
+  ├── actions/setup-python@v5
+  ├── aws-actions/setup-sam@v2
+  ├── aws-actions/configure-aws-credentials@v4  (OIDC)
+  ├── sam build --use-container --template deployment.yaml
+  └── sam deploy
+        --no-confirm-changeset
+        --no-fail-on-empty-changeset
+        --resolve-s3
+        --stack-name deployweave-<env>
+        --parameter-overrides Environment=<env>
+        --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
+        --region us-east-1
+        │
+        ▼ (only when env == sandbox)
+  [sandbox-teardown job]
+  ├── aws-actions/configure-aws-credentials@v4  (OIDC)
+  ├── sleep 3600  (hold runner for 1 hour)
+  └── sam delete --stack-name deployweave-sandbox --no-prompts
+```
+
+### Artifact upload via `--resolve-s3`
+
+SAM must upload Lambda deployment packages (ZIP files of the Python source) to S3 before CloudFormation can reference them. `--resolve-s3` causes SAM to automatically create and manage a bucket named `aws-sam-cli-managed-default-samclisourcebucket-<hash>` in the deploying account and region. SAM deduplicates uploads by content hash, so unchanged functions are skipped on subsequent deployments.
+
+### Environment matrix
+
+| Environment | Trigger | Stack name | Auto-teardown |
+|---|---|---|---|
+| `prod` | push to `main` | `deployweave-prod` | No |
+| `staging` | manual dispatch | `deployweave-staging` | No |
+| `dev` | manual dispatch | `deployweave-dev` | No |
+| `sandbox` | manual dispatch or feature branch | `deployweave-sandbox` | Yes, 1 hour TTL |
+
+### Stack outputs available post-deploy
+
+The CloudFormation stack exports 14 values (see [Infrastructure (SAM)](#infrastructure-sam) — Outputs table). Downstream stacks can reference them via `Fn::ImportValue: deployweave-<resource>-<env>`.
 
 ---
 
