@@ -92,7 +92,7 @@ LoRA adapters are only applied when the model is LoRA-compatible (Titan and Llam
       "bedrock_agent_id": "ABCDE12345",
       "model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
       "lora_applied": false,
-      "expires_at": "2026-04-20T14:30:00+00:00"
+      "expires_at": "2026-04-24T14:30:00+00:00"
     }
   ],
   "provision_status": "success",
@@ -211,15 +211,26 @@ pip install -r requirements.txt
 
 ## Deployment
 
+### CI/CD (recommended)
+
+Push to `main` to deploy to `prod` automatically via GitHub Actions. For other environments, trigger `deploy.yml` manually via `workflow_dispatch` and select the target environment (`sandbox`, `dev`, `staging`, `prod`).
+
+The workflow authenticates to AWS via OIDC (no long-lived credentials) and uses SAM to build and deploy.
+
+### Manual deploy
+
 ```bash
-sam build
-sam deploy --guided
+sam build --use-container --template deployment.yaml
+
+sam deploy \
+  --resolve-s3 \
+  --stack-name deployweave-dev \
+  --parameter-overrides Environment=dev \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --region us-east-1
 ```
 
-Key parameters:
-- **Stack Name**: `deployweave-dev`
-- **AWS Region**: `us-east-1`
-- **Environment**: `dev` / `staging` / `prod`
+`--resolve-s3` creates a SAM-managed S3 bucket automatically for Lambda artifact uploads. Replace `dev` with `sandbox`, `staging`, or `prod` as needed.
 
 ## Running the MCP Server
 
@@ -254,13 +265,14 @@ All 85 tests mock AWS calls — no live credentials required.
 
 | Variable | Default | Description |
 |---|---|---|
-| `AWS_REGION` | `us-east-1` | AWS region for all services |
 | `AGENT_TABLE` | `deployweave-agent-registry` | DynamoDB agent registry |
 | `ADAPTER_TABLE` | `deployweave-adapter-catalog` | DynamoDB adapter catalog |
 | `METRICS_TABLE` | `deployweave-model-metrics` | DynamoDB A/B metrics |
-| `CLEANUP_QUEUE_URL` | — | SQS cleanup queue URL (set by SAM) |
+| `CLEANUP_QUEUE_URL` | — | SQS cleanup queue URL (injected by SAM) |
 | `CONTRACT_TABLE` | `deployweave-contracts` | DynamoDB contract + wallet table |
-| `ALERTS_TOPIC_ARN` | — | SNS topic ARN for threshold alerts (set by SAM) |
+| `ALERTS_TOPIC_ARN` | — | SNS topic ARN for threshold alerts (injected by SAM) |
+
+`AWS_REGION` is not listed here — Lambda injects it automatically and it cannot be set manually.
 
 ## DynamoDB Tables
 
@@ -300,3 +312,4 @@ All 85 tests mock AWS calls — no live credentials required.
 - DynamoDB conditional updates prevent race conditions on token wallet modifications
 - Reservation pattern ensures atomic pre-allocation before any Bedrock call is made
 - Alert deduplication prevents SNS spam under concurrent invocations
+- GitHub Actions uses OIDC for AWS authentication — no long-lived secrets stored in GitHub
