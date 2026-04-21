@@ -70,6 +70,7 @@ jobs:
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
+            --resolve-s3 \
             --stack-name deployweave-${{ env.TARGET_ENV }} \
             --parameter-overrides Environment=${{ env.TARGET_ENV }} \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
