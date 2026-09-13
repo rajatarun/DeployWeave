@@ -12,6 +12,7 @@ Globals:
         AGENT_TABLE: !Ref AgentRegistryTable
         ADAPTER_TABLE: !Ref AdapterCatalogTable
         METRICS_TABLE: !Ref ModelMetricsTable
+        OBSERVATORY_METRICS_TABLE: !Ref ObservatoryMetricsTableName
         CLEANUP_QUEUE_URL: !Ref CleanupQueue
 
 Parameters:
@@ -21,9 +22,22 @@ Parameters:
     AllowedValues: [sandbox, dev, staging, prod]
     Description: Deployment environment
 
+  ObservatoryMetricsTableName:
+    Type: String
+    Default: ""
+    Description: >
+      Shared platform telemetry table written by mcp-observatory across the
+      sibling products (the shared stack's ObservatoryMetricsTableName output).
+      When set, model_selector scores candidates from those spans instead of
+      DeployWeave's own model-metrics table, which only sees DeployWeave's own
+      traffic. Leave empty to keep using ModelMetricsTable alone.
+
 # ============================================================
 # Resources
 # ============================================================
+Conditions:
+  HasObservatoryTable: !Not [!Equals [!Ref ObservatoryMetricsTableName, ""]]
+
 Resources:
 
   # ----------------------------------------------------------
@@ -221,6 +235,19 @@ Resources:
                   - !Sub "${AgentRegistryTable.Arn}/index/*"
                   - !GetAtt AgentRegistryTable.StreamArn
                   - !GetAtt ContractsTable.Arn
+              # Read-only access to the shared observatory table. DeployWeave
+              # consumes those spans; the products that emit them own writing.
+              - !If
+                - HasObservatoryTable
+                - Sid: ObservatoryMetricsRead
+                  Effect: Allow
+                  Action:
+                    - dynamodb:Query
+                    - dynamodb:GetItem
+                  Resource:
+                    - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ObservatoryMetricsTableName}"
+                    - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ObservatoryMetricsTableName}/index/*"
+                - !Ref AWS::NoValue
               - Sid: SNSAccess
                 Effect: Allow
                 Action:
