@@ -144,7 +144,10 @@ back as `score_source`:
 1. **`observatory`** — used when `OBSERVATORY_METRICS_TABLE` is set. The shared
    platform telemetry table carries an mcp-observatory span per model call from
    every sibling product, so it is a far larger sample than DeployWeave's own
-   traffic. Per model, over the most recent spans:
+   traffic. Spans are read through the shared table's `SpanTimelineIndex` GSI
+   (`span_date` + `timestamp`, filtered on `operation`) over the last 7 days,
+   capped at the 200 most recent — so a writer's spans count whatever partition
+   key it chose, which was not true before contract v2.0.0. Per model:
 
    ```
    quality     = 1 - mean(composite_risk_score)                     # risk is 0..1, lower better
