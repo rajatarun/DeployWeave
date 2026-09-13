@@ -11,6 +11,7 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 from fastmcp import FastMCP
 
+import observatory_metrics
 from lora_validator import validate_lora_compatibility
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,9 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 ADAPTER_TABLE = os.environ.get("ADAPTER_TABLE", "deployweave-adapter-catalog")
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "deployweave-model-metrics")
 AGENT_TABLE = os.environ.get("AGENT_TABLE", "deployweave-agent-registry")
+# Shared platform telemetry table (mcp-observatory spans from all five
+# sibling products). Optional — unset means "use METRICS_TABLE only".
+OBSERVATORY_TABLE = os.environ.get("OBSERVATORY_METRICS_TABLE", "")
 
 MODEL_HAIKU = "anthropic.claude-3-haiku-20240307-v1:0"
 MODEL_SONNET = "anthropic.claude-3-5-sonnet-20241022-v2:0"
@@ -96,6 +100,46 @@ def _score_model(items: list[dict]) -> float:
     return sum(scores) / len(scores)
 
 
+def _observatory_scores(latency_budget_ms: int) -> dict[str, dict]:
+    """Score the candidate models from shared observatory spans.
+
+    Returns an empty dict when the table is not configured, unreadable, or
+    holds no spans for any candidate — every one of which means "fall back to
+    DeployWeave's own metrics table".
+    """
+    if not OBSERVATORY_TABLE:
+        return {}
+    try:
+        table = get_dynamodb().Table(OBSERVATORY_TABLE)
+        spans = observatory_metrics.fetch_model_spans(table)
+    except Exception:
+        logger.warning("Observatory spans unavailable; falling back to %s", METRICS_TABLE)
+        return {}
+    return observatory_metrics.score_models(
+        spans, latency_budget_ms=latency_budget_ms, candidates=CANDIDATE_MODELS
+    )
+
+
+def _candidate_scores(task_type: str, latency_budget_ms: int) -> tuple[dict[str, float], str, dict]:
+    """Score every candidate model, preferring shared observatory telemetry.
+
+    Returns ``(scores, source, detail)`` where ``source`` is ``"observatory"``
+    or ``"deployweave-model-metrics"`` and ``detail`` carries the per-model
+    breakdown when the observatory was used.
+    """
+    observatory = _observatory_scores(latency_budget_ms)
+    if observatory:
+        scores = {m: observatory[m]["score"] if m in observatory else 0.0 for m in CANDIDATE_MODELS}
+        return scores, "observatory", observatory
+
+    scores, detail = {}, {}
+    for model in CANDIDATE_MODELS:
+        items = _query_model_metrics(model, task_type)
+        scores[model] = _score_model(items)
+        detail[model] = {"sample_count": len(items)}
+    return scores, "deployweave-model-metrics", detail
+
+
 def _ts_to_iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
@@ -128,15 +172,19 @@ async def model_selector(
         }
 
     if ab_mode == "winner":
-        scores: dict[str, float] = {}
-        for model in CANDIDATE_MODELS:
-            items = _query_model_metrics(model, task_type)
-            scores[model] = _score_model(items)
+        scores, score_source, _detail = _candidate_scores(task_type, latency_budget_ms)
 
         best = max(scores, key=lambda m: scores[m])
         if scores[best] == 0.0:
             best = MODEL_SONNET
             reasoning = "No historical metrics; defaulting to Sonnet"
+        elif score_source == "observatory":
+            # Observatory spans carry no task_type: this is a platform-wide
+            # per-model score, not a per-task one.
+            reasoning = (
+                f"Highest composite score ({scores[best]:.3f}) across recent platform-wide "
+                f"observatory spans (quality/latency/cost)"
+            )
         else:
             reasoning = f"Highest composite score ({scores[best]:.3f}) across recent {task_type} runs"
 
@@ -147,6 +195,7 @@ async def model_selector(
             "secondary_model": None,
             "reasoning": reasoning,
             "ab_mode": "winner",
+            "score_source": score_source,
             "estimated_cost_usd": round(cost, 8),
             "metrics": MODEL_COST_MAP[best],
         }
@@ -170,16 +219,24 @@ async def model_selector(
         }
 
     # ab_mode == "metric"
+    scores, score_source, detail = _candidate_scores(task_type, latency_budget_ms)
     candidates = []
     for model in CANDIDATE_MODELS:
-        items = _query_model_metrics(model, task_type)
-        candidates.append({
+        breakdown = detail.get(model, {})
+        entry = {
             "model": model,
-            "score": round(_score_model(items), 4),
-            "sample_count": len(items),
+            "score": round(scores[model], 4),
+            "sample_count": breakdown.get("sample_count", 0),
             "cost_per_1k_input": MODEL_COST_MAP[model]["input"],
             "cost_per_1k_output": MODEL_COST_MAP[model]["output"],
-        })
+        }
+        if score_source == "observatory" and breakdown:
+            entry.update({
+                "mean_latency_ms": breakdown.get("mean_latency_ms"),
+                "mean_cost_usd": breakdown.get("mean_cost_usd"),
+                "mean_composite_risk": breakdown.get("mean_composite_risk"),
+            })
+        candidates.append(entry)
     candidates.sort(key=lambda c: c["score"], reverse=True)
     best = candidates[0]["model"] if candidates[0]["score"] > 0 else MODEL_SONNET
     cost = (token_budget / 1000) * MODEL_COST_MAP[best]["input"]
@@ -189,6 +246,7 @@ async def model_selector(
         "secondary_model": None,
         "reasoning": "All candidates returned with historical metrics for inspection",
         "ab_mode": "metric",
+        "score_source": score_source,
         "candidates": candidates,
         "estimated_cost_usd": round(cost, 8),
         "metrics": MODEL_COST_MAP[best],
