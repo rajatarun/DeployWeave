@@ -48,6 +48,70 @@ See [docs/architecture.md](docs/architecture.md) for the full architecture deep-
 
 ---
 
+---
+
+## The closed loop (TeamWeave → TrainWeave → DeployWeave)
+
+DeployWeave is the last two hops of a training flywheel that spans three
+repositories. Arrows marked **[code]** run by themselves; arrows marked
+**[manual]** need a person.
+
+```
+ TeamWeave                     TrainWeave                    DeployWeave
+ ─────────                     ──────────                    ───────────
+ worker_handler invokes each
+ step twice, keeps the answer
+ with the lower composite risk
+        │
+        │ [code] dpo_collector writes a chosen/rejected record per step
+        ▼
+ s3://$DPO_TRAINING_BUCKET/{project}/{team}/{step_id}/{run_id}/dpo_*.json
+        │
+        │ [manual] someone decides there are enough pairs and invokes the
+        │          TrainWeave orchestrator with
+        │          dataset_source={"type":"dpo","bucket":…,"prefix":…}
+        ▼
+                   app.py::_materialise_dpo_dataset          [code]
+                     train.jsonl      SFT rows (trained on)
+                     train.dpo.jsonl  preference pairs (NOT trained on yet)
+                               │
+                               │ [code] EC2 spot → bootstrap.sh → train.py
+                               ▼
+                   s3://$ARTIFACTS_BUCKET/adapters/{job_id}/
+                               │
+                               │ [code] bootstrap.sh → register_adapter.py
+                               │        (skipped when ADAPTER_CATALOG_TABLE unset)
+                               ▼
+                                          DynamoDB deployweave-adapter-catalog
+                                                     │
+                                                     │ [code] adapter_resolver
+                                                     │        team_provisioner
+                                                     ▼
+                                          Bedrock agent with the adapter attached
+                                                     │
+        ┌────────────────────────────────────────────┘
+        │ [manual] create/publish the agent alias, then edit team.json in S3:
+        │          agents[].bedrock.model_aliases maps model_id → aliasId
+        ▼
+ TeamWeave's next run uses the new model and produces new pairs
+```
+
+### What is still manual
+
+| Step | Why |
+|---|---|
+| Deciding to train, and invoking the TrainWeave orchestrator | No trigger watches the DPO prefix for a quorum of pairs. |
+| Publishing the Bedrock agent alias for the new adapter | `team_provisioner` creates agents; alias publication is a separate, deliberate promotion. |
+| Editing `model_aliases` in `team.json` | Team configs live in S3 and are edited by a human. Nothing writes them back. |
+| Training on `train.dpo.jsonl` | TrainWeave's `train.py` is SFT-only (TRL `SFTTrainer`). The pairs are preserved, but adopting a DPO objective is a deliberate change. |
+
+Also note: `lora_validator.py` only accepts base models prefixed `amazon.titan-`
+or `meta.llama`. An adapter trained on any other base model (TrainWeave's default
+is a HuggingFace model id) registers in the catalogue but `team_provisioner` will
+decline to attach it, logging "LoRA not compatible".
+
+---
+
 ## MCP Tools
 
 ### `model_selector`
@@ -67,9 +131,44 @@ Selects the optimal Bedrock model based on latency budget and A/B testing mode.
   "selected_model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
   "reasoning": "Highest composite score (0.871) across recent reasoning runs",
   "ab_mode": "winner",
+  "score_source": "deployweave-model-metrics",
   "estimated_cost_usd": 0.0000123
 }
 ```
+
+#### Where the scores come from
+
+`winner` and `metric` modes score candidates from one of two sources, reported
+back as `score_source`:
+
+1. **`observatory`** — used when `OBSERVATORY_METRICS_TABLE` is set. The shared
+   platform telemetry table carries an mcp-observatory span per model call from
+   every sibling product, so it is a far larger sample than DeployWeave's own
+   traffic. Per model, over the most recent spans:
+
+   ```
+   quality     = 1 - mean(composite_risk_score)                     # risk is 0..1, lower better
+   latency_fit = clamp(1 - mean_latency_ms / latency_budget_ms, 0, 1)
+   cost_fit    = 1 - mean_cost_usd / max(mean_cost_usd over candidates)
+   score       = 0.5 * quality + 0.3 * latency_fit + 0.2 * cost_fit
+   ```
+
+   Latency is not a span field; it is the difference between the span's
+   `start_time` and `end_time`. A span with no risk score counts as neutral
+   (0.5), and a model with no timing data scores neutral on latency rather
+   than as if it were instant. `cost_fit` is relative to the most expensive
+   candidate in the same comparison — there is no absolute cost budget.
+
+   **Limitation:** observatory spans carry no `task_type`, so these are
+   per-model platform-wide scores, not per-task ones.
+
+2. **`deployweave-model-metrics`** (fallback) — the original, task-specific
+   `success_rate * 0.6 + accuracy_score * 0.4` over `METRICS_TABLE`. Used
+   whenever `OBSERVATORY_METRICS_TABLE` is unset, unreadable, or holds no
+   spans for any candidate model.
+
+The formula lives in `observatory_metrics.py`; its tests are in
+`test_observatory_metrics.py`.
 
 ### `team_provisioner`
 
@@ -254,10 +353,13 @@ Or add to Claude Code MCP settings:
 ## Running Tests
 
 ```bash
-python -m pytest unit_tests.py -v
+python -m pytest -q                      # collects test_*.py
+python -m pytest unit_tests.py -v        # the MCP tool suite (needs fastmcp installed)
 ```
 
-All 85 tests mock AWS calls — no live credentials required.
+All tests mock AWS calls — no live credentials required. `unit_tests.py` imports
+`deployweave_mcp` and therefore needs `fastmcp`; `test_observatory_metrics.py`
+deliberately does not, so the scoring logic can be tested without the MCP stack.
 
 ---
 
@@ -267,7 +369,8 @@ All 85 tests mock AWS calls — no live credentials required.
 |---|---|---|
 | `AGENT_TABLE` | `deployweave-agent-registry` | DynamoDB agent registry |
 | `ADAPTER_TABLE` | `deployweave-adapter-catalog` | DynamoDB adapter catalog |
-| `METRICS_TABLE` | `deployweave-model-metrics` | DynamoDB A/B metrics |
+| `METRICS_TABLE` | `deployweave-model-metrics` | DynamoDB A/B metrics (fallback score source) |
+| `OBSERVATORY_METRICS_TABLE` | — | Shared mcp-observatory span table. When set, `model_selector` scores from it instead |
 | `CLEANUP_QUEUE_URL` | — | SQS cleanup queue URL (injected by SAM) |
 | `CONTRACT_TABLE` | `deployweave-contracts` | DynamoDB contract + wallet table |
 | `ALERTS_TOPIC_ARN` | — | SNS topic ARN for threshold alerts (injected by SAM) |
