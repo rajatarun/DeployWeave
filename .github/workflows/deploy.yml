@@ -33,7 +33,7 @@ jobs:
         run: pip install -r requirements.txt pytest
 
       - name: Run tests
-        run: python -m pytest unit_tests.py -v
+        run: python -m pytest -v
 
   deploy:
     name: SAM Deploy (${{ github.event.inputs.environment || 'prod' }})
