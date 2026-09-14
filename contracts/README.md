@@ -7,12 +7,15 @@ shared `OBSERVATORY_METRICS` DynamoDB table contract:
 https://github.com/rajatarun/mcp-observatory/blob/main/contracts/observatory_metrics_item.json
 
 DeployWeave is a **reader** on that table (`observatory_metrics.py`, which
-queries the `OBSERVATORY#invoke_model` partition for model-scoring spans).
+reads model-scoring spans through the `SpanTimelineIndex` GSI — `span_date` +
+`timestamp` — and filters on `operation`). Until contract v2.0.0 it queried the
+`OBSERVATORY#invoke_model` partition by pk instead, and so saw only the writers
+that had guessed that prefix; three of five had not.
 `test_shared_table_contract.py` checks, from this vendored file rather than
-from retyped constants, that the pk DeployWeave queries still parses against
-the contract and that the contract still lists DeployWeave as a reader of
-that namespace — so the two sides of this interface cannot silently drift
-apart.
+from retyped constants, that the reader queries the index the contract names by
+the key attributes the contract names, and that its pre-index fallback is narrow
+enough not to hide a real failure — so the two sides of this interface cannot
+silently drift apart.
 
 ## Keeping this in sync
 
