@@ -29,8 +29,18 @@ jobs:
           python-version: '3.11'
           cache: pip
 
+      # pip's default is a single attempt per index request, so one bad
+      # response from PyPI fails the whole job. That is what happened on run
+      # #12: `boto3>=1.34.0 (from versions: none)` while fastmcp had resolved
+      # from the same index seconds earlier. boto3 has 679 releases at or above
+      # 1.34 -- "no versions" was the index failing to answer, not the
+      # requirement being unsatisfiable.
+      #
+      # --retries with a backoff makes that self-healing. It cannot mask a
+      # genuinely missing package: a requirement with no matching release still
+      # fails, just five attempts later.
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest
+        run: pip install --retries 5 --timeout 30 -r requirements.txt pytest
 
       - name: Run tests
         run: python -m pytest -v
