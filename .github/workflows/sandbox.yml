@@ -74,6 +74,7 @@ jobs:
           sam deploy \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
+            --resolve-s3 \
             --stack-name ${{ steps.stack-name.outputs.value }} \
             --parameter-overrides Environment=sandbox \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
