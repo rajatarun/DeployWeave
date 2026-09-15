@@ -22,6 +22,26 @@ Parameters:
     AllowedValues: [sandbox, dev, staging, prod]
     Description: Deployment environment
 
+  ResourceSuffix:
+    Type: String
+    Default: ""
+    Description: >
+      Appended to the physical names of the six resources that are NOT scoped
+      by environment: four DynamoDB tables and two SQS queues. Every other
+      named resource already interpolates the Environment parameter.
+
+      Those six therefore had one global name per account, so a sandbox stack
+      tried to create tables and queues the dev stack already owns and the
+      changeset failed EarlyValidation ResourceExistenceCheck. The sandbox
+      workflow could never deploy.
+
+      The default is deliberately the empty string: with it, every name below
+      resolves to exactly the literal it was before this parameter existed, so
+      dev and prod see no change and CloudFormation does not replace a table.
+      Only a caller that passes a suffix gets different names. Do NOT give this
+      a non-empty default -- renaming a DynamoDB table replaces it, and the
+      data goes with the old one.
+
   ObservatoryMetricsTableName:
     Type: String
     Default: ""
@@ -47,7 +67,7 @@ Resources:
   AdapterCatalogTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: deployweave-adapter-catalog
+      TableName: !Sub "deployweave-adapter-catalog${ResourceSuffix}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: adapter_id
@@ -92,7 +112,7 @@ Resources:
   ModelMetricsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: deployweave-model-metrics
+      TableName: !Sub "deployweave-model-metrics${ResourceSuffix}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: model_id
@@ -108,7 +128,7 @@ Resources:
   AgentRegistryTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: deployweave-agent-registry
+      TableName: !Sub "deployweave-agent-registry${ResourceSuffix}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: agent_id
@@ -139,7 +159,7 @@ Resources:
   ContractsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: deployweave-contracts
+      TableName: !Sub "deployweave-contracts${ResourceSuffix}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: contract_id
@@ -155,13 +175,13 @@ Resources:
   CleanupDLQ:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: deployweave-cleanup-dlq
+      QueueName: !Sub "deployweave-cleanup-dlq${ResourceSuffix}"
       MessageRetentionPeriod: 1209600  # 14 days for investigation
 
   CleanupQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: deployweave-cleanup-queue
+      QueueName: !Sub "deployweave-cleanup-queue${ResourceSuffix}"
       # VisibilityTimeout must be >= 6x Lambda timeout (300s)
       VisibilityTimeout: 1800
       MessageRetentionPeriod: 86400  # 24 hours
