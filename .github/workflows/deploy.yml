@@ -68,8 +68,8 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
-          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
           role-session-name: deployweave-${{ env.TARGET_ENV }}-${{ github.run_id }}
 
       - name: SAM Build
@@ -84,7 +84,7 @@ jobs:
             --stack-name deployweave-${{ env.TARGET_ENV }} \
             --parameter-overrides Environment=${{ env.TARGET_ENV }} \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-            --region us-east-1
+            --region ${{ vars.AWS_REGION }}
 
   # Sandbox stacks self-destruct after 1 hour.
   # This job holds the runner for 60 min then tears down the stack.
@@ -104,8 +104,8 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
-          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
           role-session-name: deployweave-sandbox-teardown-${{ github.run_id }}
 
       - name: Wait 1 hour
@@ -116,4 +116,4 @@ jobs:
           sam delete \
             --stack-name deployweave-sandbox \
             --no-prompts \
-            --region us-east-1
+            --region ${{ vars.AWS_REGION }}

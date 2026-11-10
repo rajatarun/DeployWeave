@@ -4,7 +4,7 @@
 unmodified copy vendored from **mcp-observatory**, the canonical home of the
 shared `OBSERVATORY_METRICS` DynamoDB table contract:
 
-https://github.com/rajatarun/mcp-observatory/blob/main/contracts/observatory_metrics_item.json
+https://github.com/example-org/mcp-observatory/blob/main/contracts/observatory_metrics_item.json
 
 DeployWeave is a **reader** on that table (`observatory_metrics.py`, which
 reads model-scoring spans through the `SpanTimelineIndex` GSI — `span_date` +
