@@ -86,8 +86,8 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
-          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
           role-session-name: deployweave-sb-${{ github.run_id }}
 
       - name: SAM Build
@@ -102,7 +102,7 @@ jobs:
             --stack-name ${{ steps.stack-name.outputs.value }} \
             --parameter-overrides Environment=sandbox ResourceSuffix=${{ steps.stack-name.outputs.suffix }} \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-            --region us-east-1
+            --region ${{ vars.AWS_REGION }}
 
   teardown-sandbox:
     name: Teardown Sandbox (60 min TTL)
@@ -119,8 +119,8 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
-          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
           role-session-name: deployweave-sb-teardown-${{ github.run_id }}
 
       - name: Wait 60 minutes
@@ -131,4 +131,4 @@ jobs:
           sam delete \
             --stack-name ${{ needs.deploy-sandbox.outputs.stack-name }} \
             --no-prompts \
-            --region us-east-1
+            --region ${{ vars.AWS_REGION }}

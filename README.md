@@ -136,7 +136,7 @@ sam deploy \
   --region us-east-1
 ```
 
-CI on `main` runs tests then deploys to `prod` via GitHub Actions OIDC (see `.github/workflows/deploy.yml`). Use `workflow_dispatch` for `sandbox`, `dev`, or `staging`.
+CI on `main` runs tests then deploys to `prod` via GitHub Actions OIDC (see `.github/workflows/deploy.yml`). Use `workflow_dispatch` for `sandbox`, `dev`, or `staging`. Configure repository secrets and variables first — see [docs/DEPLOY_CONFIG.md](docs/DEPLOY_CONFIG.md).
 
 ---
 
