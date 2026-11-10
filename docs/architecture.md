@@ -559,7 +559,7 @@ All Lambda functions share `DeployWeaveLambdaRole`.
 
 ### Authentication
 
-All workflows authenticate to AWS using OIDC via `aws-actions/configure-aws-credentials`. No long-lived access keys are stored in GitHub. The assumed role is `arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer`.
+All workflows authenticate to AWS using OIDC via `aws-actions/configure-aws-credentials`. No long-lived access keys are stored in GitHub. The assumed role ARN is supplied via the repository secret `AWS_DEPLOY_ROLE_ARN` (for example `arn:aws:iam::123456789012:role/example-deploy-role`). The deploy region is set with the repository variable `AWS_REGION` (for example `us-east-1`). See [DEPLOY_CONFIG.md](DEPLOY_CONFIG.md) for the full list.
 
 ### `deploy.yml` — Production and manual deploys
 
@@ -585,7 +585,7 @@ push to main  ──or──  workflow_dispatch (env: sandbox|dev|staging|prod)
         --stack-name deployweave-<env>
         --parameter-overrides Environment=<env>
         --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
-        --region us-east-1
+        --region <AWS_REGION>
         │
         ▼ (only when env == sandbox)
   [sandbox-teardown job]

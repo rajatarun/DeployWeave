@@ -1,10 +1,10 @@
 {
   "contract": "observatory_metrics_item",
   "version": "2.0.0",
-  "canonical_home": "https://github.com/rajatarun/mcp-observatory/blob/main/contracts/observatory_metrics_item.json",
+  "canonical_home": "https://github.com/example-org/mcp-observatory/blob/main/contracts/observatory_metrics_item.json",
   "description": [
     "The item contract for the shared OBSERVATORY_METRICS DynamoDB table, provisioned by",
-    "the tarun-teamweave-shared stack and written by every weave service that emits span",
+    "the shared platform stack (for example deployweave-shared) and written by every weave service that emits span",
     "telemetry. The table has many writers in different languages and several readers that",
     "build dashboards from it, none of which can see each other's code, so the item shape",
     "is a cross-repository interface and is pinned here rather than in any one consumer.",
