@@ -3,7 +3,6 @@ import os
 import time
 
 import boto3
-from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -94,20 +93,20 @@ def commit_tokens(
     reserved_input = reservation.get("input_reserved", actual_input)
     reserved_output = reservation.get("output_reserved", actual_output)
 
-    # Refund = what was reserved but not used (can be 0 or positive)
-    refund_input = max(0, reserved_input - actual_input)
-    refund_output = max(0, reserved_output - actual_output)
+    # Signed delta: positive refunds unused reservation; negative deducts overage from remaining.
+    delta_input = reserved_input - actual_input
+    delta_output = reserved_output - actual_output
 
     table.update_item(
         Key={"contract_id": contract_id},
         UpdateExpression=(
             "SET token_wallet.#inp.consumed = token_wallet.#inp.consumed + :actual_in,"
             "    token_wallet.#inp.reserved = token_wallet.#inp.reserved - :res_in,"
-            "    token_wallet.#inp.#rem = token_wallet.#inp.#rem + :refund_in,"
+            "    token_wallet.#inp.#rem = token_wallet.#inp.#rem + :delta_in,"
             "    token_wallet.#inp.cached = token_wallet.#inp.cached + :cached_in,"
             "    token_wallet.#out.consumed = token_wallet.#out.consumed + :actual_out,"
             "    token_wallet.#out.reserved = token_wallet.#out.reserved - :res_out,"
-            "    token_wallet.#out.#rem = token_wallet.#out.#rem + :refund_out"
+            "    token_wallet.#out.#rem = token_wallet.#out.#rem + :delta_out"
             " REMOVE reservations.#rid"
         ),
         ExpressionAttributeNames={
@@ -122,8 +121,8 @@ def commit_tokens(
             ":cached_in": cached_input,
             ":res_in": reserved_input,
             ":res_out": reserved_output,
-            ":refund_in": refund_input,
-            ":refund_out": refund_output,
+            ":delta_in": delta_input,
+            ":delta_out": delta_output,
         },
     )
 

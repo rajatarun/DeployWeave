@@ -757,6 +757,24 @@ class TestReservationManager(unittest.TestCase):
         mock_table.get_item.assert_called_once()
         mock_table.update_item.assert_called_once()
 
+    def test_commit_tokens_deducts_overage_when_actual_exceeds_reserved(self):
+        import reservation_manager as rm
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {
+            "Item": {
+                "contract_id": "c1",
+                "reservations": {
+                    "res-over": {"input_reserved": 100, "output_reserved": 200},
+                },
+            }
+        }
+        with patch.object(rm, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            rm.commit_tokens("c1", "res-over", actual_input=160, actual_output=350, cached_input=0)
+        vals = mock_table.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertEqual(vals[":delta_in"], -60)
+        self.assertEqual(vals[":delta_out"], -150)
+
     def test_release_reservation_fetches_then_updates(self):
         import reservation_manager as rm
         mock_table = MagicMock()
@@ -1059,6 +1077,10 @@ class TestOrphanReconciliation(unittest.TestCase):
 
         mock_bedrock = MagicMock()
         mock_bedrock.list_agents.return_value = {"agentSummaries": [{"agentId": "BID-orphan"}]}
+        mock_bedrock.get_agent.return_value = {
+            "agent": {"agentArn": "arn:aws:bedrock:us-east-1:123456789012:agent/BID-orphan"}
+        }
+        mock_bedrock.list_tags_for_resource.return_value = {"tags": {"ManagedBy": "DeployWeave"}}
         mock_table = MagicMock()
         mock_table.scan.return_value = {"Items": []}
 
@@ -1069,6 +1091,42 @@ class TestOrphanReconciliation(unittest.TestCase):
 
         mock_bedrock.delete_agent.assert_called_once_with(agentId="BID-orphan", skipResourceInUseCheck=True)
         self.assertEqual(result["bedrock_orphans_deleted"], 1)
+
+    def test_untagged_bedrock_agent_not_deleted(self):
+        import orphan_reconciliation as orec
+
+        mock_bedrock = MagicMock()
+        mock_bedrock.list_agents.return_value = {"agentSummaries": [{"agentId": "BID-foreign"}]}
+        mock_bedrock.get_agent.return_value = {
+            "agent": {"agentArn": "arn:aws:bedrock:us-east-1:123456789012:agent/BID-foreign"}
+        }
+        mock_bedrock.list_tags_for_resource.return_value = {"tags": {"Owner": "other-team"}}
+        mock_table = MagicMock()
+        mock_table.scan.return_value = {"Items": []}
+
+        with patch.object(orec, "get_bedrock_agents", return_value=mock_bedrock), \
+             patch.object(orec, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            result = orec.orphan_reconciliation_handler({}, None)
+
+        mock_bedrock.delete_agent.assert_not_called()
+        self.assertEqual(result["bedrock_orphans_deleted"], 0)
+
+    def test_invocation_gateway_parses_apigw_json_body(self):
+        import invocation_gateway as ig
+
+        bad = ig.invocation_gateway_handler({"body": "{not-json"}, None)
+        self.assertEqual(bad["statusCode"], 400)
+
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {}
+        with patch.object(ig, "get_dynamodb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            res = ig.invocation_gateway_handler(
+                {"body": json.dumps({"agent_id": "a-missing", "input_text": "hi", "session_id": "s1"})},
+                None,
+            )
+        self.assertEqual(res["statusCode"], 404)
 
     def test_dynamo_stale_record_deleted(self):
         import orphan_reconciliation as orec

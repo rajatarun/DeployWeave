@@ -88,6 +88,24 @@ def _collect_bedrock_response(event_stream) -> tuple[str, int, int, int]:
     return completion, input_tokens, output_tokens, cached_tokens
 
 
+def _extract_payload(event: dict) -> dict | None:
+    """Support both direct Lambda payloads and API Gateway proxy events with JSON body."""
+    if not isinstance(event, dict):
+        return None
+    if "body" in event and "agent_id" not in event:
+        body = event["body"]
+        if isinstance(body, dict):
+            return body
+        if isinstance(body, str):
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+    return event
+
+
 def invocation_gateway_handler(event: dict, context) -> dict:
     """
     Real-time token enforcement wrapper for Bedrock agent invocations.
@@ -97,10 +115,14 @@ def invocation_gateway_handler(event: dict, context) -> dict:
     insufficient and 500 on Bedrock errors (releasing the reservation first).
     """
     # --- Parse input ---
-    agent_id = event.get("agent_id")
-    input_text = event.get("input_text", "")
-    session_id = event.get("session_id")
-    max_expected_output_tokens = event.get("max_expected_output_tokens", 500)
+    payload = _extract_payload(event)
+    if payload is None:
+        return {"statusCode": 400, "body": "Invalid JSON in request body"}
+
+    agent_id = payload.get("agent_id")
+    input_text = payload.get("input_text", "")
+    session_id = payload.get("session_id")
+    max_expected_output_tokens = payload.get("max_expected_output_tokens", 500)
 
     if not agent_id or not input_text or not session_id:
         return {"statusCode": 400, "body": "Missing required fields: agent_id, input_text, session_id"}

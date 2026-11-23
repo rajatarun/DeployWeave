@@ -152,7 +152,12 @@ async def model_selector(
     ab_mode: str = "winner",
     ab_split_ratio: float = 0.8,
 ) -> dict:
-    """Select the optimal Bedrock model based on task constraints and A/B testing mode."""
+    """Select the optimal Bedrock model based on task constraints and A/B testing mode.
+
+    Deprecated: for multi-provider / local-vs-cloud model routing, prefer
+    ModelWeave (https://github.com/rajatarun/ModelWeave). Retained here for
+    backwards compatibility with existing Bedrock-only DeployWeave stacks.
+    """
     if ab_mode not in ("winner", "split", "metric"):
         raise ValueError(f"ab_mode must be 'winner', 'split', or 'metric'; got '{ab_mode}'")
 

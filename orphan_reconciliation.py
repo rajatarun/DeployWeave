@@ -28,8 +28,34 @@ def get_bedrock_agents():
     return _bedrock_agents
 
 
-def should_delete_orphan(bedrock_agent_id: str) -> bool:  # noqa: ARG001
-    return True
+MANAGED_TAG_KEY = os.environ.get("DEPLOYWEAVE_MANAGED_TAG_KEY", "ManagedBy")
+MANAGED_TAG_VALUE = os.environ.get("DEPLOYWEAVE_MANAGED_TAG_VALUE", "DeployWeave")
+
+
+def should_delete_orphan(bedrock_agent_id: str) -> bool:
+    """Fail-closed ownership guard: only delete Bedrock agents tagged ManagedBy=DeployWeave."""
+    client = get_bedrock_agents()
+    try:
+        agent_resp = client.get_agent(agentId=bedrock_agent_id)
+        agent_arn = agent_resp.get("agent", {}).get("agentArn")
+        if not agent_arn:
+            logger.warning("Orphan %s missing agentArn; refusing deletion", bedrock_agent_id)
+            return False
+        tags_resp = client.list_tags_for_resource(resourceArn=agent_arn)
+        tags = tags_resp.get("tags", {})
+        if tags.get(MANAGED_TAG_KEY) != MANAGED_TAG_VALUE:
+            logger.info(
+                "Skipping orphan %s: tag %s=%r != %r",
+                bedrock_agent_id,
+                MANAGED_TAG_KEY,
+                tags.get(MANAGED_TAG_KEY),
+                MANAGED_TAG_VALUE,
+            )
+            return False
+        return True
+    except ClientError as e:
+        logger.warning("Tag check failed for %s (%s); refusing deletion", bedrock_agent_id, e)
+        return False
 
 
 def _list_all_bedrock_agent_ids() -> set:
