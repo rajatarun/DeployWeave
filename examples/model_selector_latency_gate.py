@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import deployweave_mcp as m  # noqa: E402
+import deployweave_mcp as m
 
 
 async def main() -> None:

@@ -8,15 +8,14 @@ from __future__ import annotations
 
 import json
 import random
-from datetime import datetime, timedelta, timezone
-
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import observatory_metrics  # noqa: E402
+import observatory_metrics
 
 MODELS = [
     "anthropic.claude-3-haiku-20240307-v1:0",
@@ -27,7 +26,7 @@ MODELS = [
 
 def _synthetic_spans(n_per_model: int = 50, seed: int = 42) -> list[dict]:
     rng = random.Random(seed)
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
     spans: list[dict] = []
     for model in MODELS:
         for i in range(n_per_model):

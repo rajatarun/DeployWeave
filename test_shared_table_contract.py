@@ -24,7 +24,7 @@ no reader queries by pk at all.
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -36,7 +36,7 @@ from contracts.conformance import check_item, load_contract, readers_for
 CONTRACT = load_contract()  # finds contracts/observatory_metrics_item.json beside conformance.py
 GSI = CONTRACT["gsi"]
 
-NOW = datetime(2026, 9, 13, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 13, 12, 0, 0, tzinfo=UTC)
 
 
 @pytest.fixture(autouse=True)

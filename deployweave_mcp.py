@@ -1,10 +1,9 @@
-import json
 import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
@@ -141,7 +140,7 @@ def _candidate_scores(task_type: str, latency_budget_ms: int) -> tuple[dict[str,
 
 
 def _ts_to_iso(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(ts, tz=UTC).isoformat()
 
 
 @mcp.tool()
@@ -266,7 +265,7 @@ def _provision_single_agent(
     spec: dict,
     ttl_hours: int,
     use_lora: bool,
-    contract_id: Optional[str] = None,
+    contract_id: str | None = None,
 ) -> dict:
     name = spec.get("name", f"agent-{uuid.uuid4().hex[:8]}")
     system_prompt = spec.get("system_prompt", "")
@@ -362,7 +361,7 @@ async def team_provisioner(
     agent_specs: list,
     ttl_hours: int = DEFAULT_TTL_HOURS,
     use_lora: bool = False,
-    contract_id: Optional[str] = None,
+    contract_id: str | None = None,
 ) -> dict:
     """Provision a set of Bedrock agents from caller-provided specs and store them with a TTL."""
     if not agent_specs:
@@ -401,11 +400,11 @@ async def team_provisioner(
 @mcp.tool()
 async def adapter_resolver(
     operation: str,
-    task_type: Optional[str] = None,
-    tags: Optional[list] = None,
-    adapter_id: Optional[str] = None,
-    base_model: Optional[str] = None,
-    adapter_metadata: Optional[dict] = None,
+    task_type: str | None = None,
+    tags: list | None = None,
+    adapter_id: str | None = None,
+    base_model: str | None = None,
+    adapter_metadata: dict | None = None,
 ) -> dict:
     """Manage the LoRA adapter catalog: list, get, register, or search adapters."""
     valid_ops = ("list_adapters", "get_adapter", "register_adapter", "search_by_tags")
@@ -493,10 +492,10 @@ async def adapter_resolver(
 @mcp.tool()
 async def agent_lifecycle(
     operation: str,
-    agent_name: Optional[str] = None,
-    system_prompt: Optional[str] = None,
-    model: Optional[str] = None,
-    agent_id: Optional[str] = None,
+    agent_name: str | None = None,
+    system_prompt: str | None = None,
+    model: str | None = None,
+    agent_id: str | None = None,
     ttl_hours: int = DEFAULT_TTL_HOURS,
 ) -> dict:
     """Manage individual Bedrock agent lifecycle: provision, list, get, delete, or extend TTL."""

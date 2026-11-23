@@ -1,10 +1,9 @@
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
-from boto3.dynamodb.conditions import Attr
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -58,7 +57,7 @@ def _publish_threshold_alert(contract: dict, threshold: int, usage_pct: float) -
         "input_allocated": wallet.get("input", {}).get("allocated", 0),
         "output_consumed": wallet.get("output", {}).get("consumed", 0),
         "output_allocated": wallet.get("output", {}).get("allocated", 0),
-        "triggered_at": datetime.now(timezone.utc).isoformat(),
+        "triggered_at": datetime.now(UTC).isoformat(),
     })
     get_sns().publish(
         TopicArn=ALERTS_TOPIC_ARN,

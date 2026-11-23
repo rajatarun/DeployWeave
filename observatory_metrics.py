@@ -59,9 +59,10 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Optional
+from typing import Any
 
 from contracts.conformance import load_contract
 
@@ -115,7 +116,7 @@ def observatory_table_name() -> str:
     return os.environ.get("OBSERVATORY_METRICS_TABLE", "").strip()
 
 
-def _to_float(value: Any) -> Optional[float]:
+def _to_float(value: Any) -> float | None:
     """Coerce a DynamoDB numeric (Decimal, int, float, numeric string) to float."""
     if value is None or isinstance(value, bool):
         return None
@@ -127,16 +128,16 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
-def _parse_time(value: Any) -> Optional[datetime]:
+def _parse_time(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return datetime.fromisoformat(value)
     except ValueError:
         return None
 
 
-def span_latency_ms(item: dict) -> Optional[float]:
+def span_latency_ms(item: dict) -> float | None:
     """Latency of one span, from its start_time/end_time pair.
 
     The observatory schema has no latency field — the wrapper records the two
@@ -207,7 +208,7 @@ def _clamp01(value: float) -> float:
 def score_models(
     items: Iterable[dict],
     latency_budget_ms: int = 1000,
-    candidates: Optional[Iterable[str]] = None,
+    candidates: Iterable[str] | None = None,
 ) -> dict[str, dict]:
     """Score each model seen in ``items``. See the module docstring for the formula.
 
@@ -254,7 +255,7 @@ def score_models(
     return scored
 
 
-def span_dates(lookback_days: int = DEFAULT_LOOKBACK_DAYS, now: Optional[datetime] = None) -> list[str]:
+def span_dates(lookback_days: int = DEFAULT_LOOKBACK_DAYS, now: datetime | None = None) -> list[str]:
     """The ``span_date`` buckets covering the last ``lookback_days`` days, newest first.
 
     Days are UTC calendar days because that is what the index is keyed on
@@ -263,7 +264,7 @@ def span_dates(lookback_days: int = DEFAULT_LOOKBACK_DAYS, now: Optional[datetim
     the sort-key condition, so the window is a rolling ``lookback_days``
     interval rather than a ragged "since midnight N days ago".
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=max(1, int(lookback_days)))
     days: list[str] = []
     day = now.date()
@@ -273,7 +274,7 @@ def span_dates(lookback_days: int = DEFAULT_LOOKBACK_DAYS, now: Optional[datetim
     return days
 
 
-def _cutoff_timestamp(lookback_days: int, now: Optional[datetime] = None) -> str:
+def _cutoff_timestamp(lookback_days: int, now: datetime | None = None) -> str:
     """Lower bound for the index sort key, as a string that compares correctly.
 
     Written without a timezone suffix on purpose. Writers disagree about how
@@ -281,7 +282,7 @@ def _cutoff_timestamp(lookback_days: int, now: Optional[datetime] = None) -> str
     and DynamoDB compares sort keys as bytes, so a cutoff that stops at the
     microseconds is a prefix all three spellings sort after.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     return (now - timedelta(days=max(1, int(lookback_days)))).strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
@@ -340,7 +341,7 @@ def fetch_model_spans(
     table,
     limit: int = DEFAULT_SPAN_LIMIT,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Read the most recent ``invoke_model`` spans from the shared table.
 

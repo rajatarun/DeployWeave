@@ -6,13 +6,12 @@ from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def _client_error(code: str) -> ClientError:
@@ -537,7 +536,6 @@ class TestCleanupLambda(unittest.TestCase):
         self.assertIn("bedrock", call_order)
 
     def test_malformed_json_fails_record(self):
-        import cleanup_lambda as cl
         bad_record = {"messageId": "msg-bad", "body": "not json", "receiptHandle": "rh"}
         result = self._invoke([bad_record])
         self.assertEqual(result["body"]["failed_cleanups"], 1)
@@ -995,7 +993,7 @@ class TestInvocationGateway(unittest.TestCase):
         with patch.object(ig, "get_dynamodb") as mock_ddb, \
              patch.object(rm, "get_dynamodb") as mock_rm_ddb, \
              patch.object(ig, "get_bedrock_agent_runtime", return_value=mock_bedrock), \
-             patch("threading.Thread") as mock_thread:
+             patch("threading.Thread"):
             self._setup_ddb_tables(mock_ddb, self._make_agent_item(), self._make_active_contract())
             mock_rm_ddb.return_value.Table.return_value = mock_rm_table
             # Override get_wallet_remaining to use contract_table_after
