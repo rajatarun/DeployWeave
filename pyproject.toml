@@ -29,6 +29,9 @@ all = [
     "deployweave[aws,mcp,dev]",
 ]
 
+[project.scripts]
+deployweave-wallet = "deployweave.cli:main"
+
 [tool.setuptools]
 packages = ["deployweave"]
 py-modules = [
