@@ -11,6 +11,7 @@ from typing import Any
 
 from deployweave.alerts import SQLiteBudgetAlertStore, evaluate_budget_forecast
 from deployweave.policy import DEFAULT_DB_PATH, SQLiteBudgetPolicyEngine
+from deployweave.snapshot import export_wallet_snapshot, restore_wallet_snapshot
 from deployweave.throttle import (
     DEFAULT_LOCAL_ONLY_THRESHOLD_PCT,
     DEFAULT_WARN_THRESHOLD_PCT,
@@ -195,6 +196,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional POSIX timestamp override for deterministic inspection.",
     )
 
+    # snapshot
+    p_snap = subparsers.add_parser(
+        "snapshot",
+        parents=[common],
+        help="Export a WAL-safe node-snapshot-v1 backup of the wallet SQLite database.",
+    )
+    p_snap.add_argument("--out", required=True, help="Output directory for snapshot files and manifest.")
+    p_snap.add_argument("--node-id", required=True, help="Originating node identifier.")
+
+    # restore
+    p_restore = subparsers.add_parser(
+        "restore",
+        parents=[common],
+        help="Verify and atomically restore a wallet SQLite database from a node-snapshot-v1 manifest.",
+    )
+    p_restore.add_argument("--manifest", required=True, help="Path to snapshot-manifest.json.")
+    p_restore.add_argument("--target-db", required=True, help="Target SQLite database file path to replace.")
+
     return parser
 
 
@@ -205,6 +224,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     as_json: bool = bool(args.as_json)
 
     try:
+        if args.command == "snapshot":
+            manifest = export_wallet_snapshot(db_path, args.out, node_id=args.node_id)
+            _emit(manifest, as_json=as_json)
+            return 0
+
+        if args.command == "restore":
+            summary = restore_wallet_snapshot(args.manifest, args.target_db)
+            _emit(summary, as_json=as_json)
+            return 0
+
         with (
             SQLiteReservationManager(db_path) as mgr,
             SQLiteBudgetAlertStore(db_path) as alert_store,
@@ -349,7 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(f"Unknown command: {cmd}")
             return 2
 
-    except (WalletError, ValueError, TypeError) as exc:
+    except (WalletError, FileNotFoundError, ValueError, TypeError) as exc:
         if as_json:
             print(
                 json.dumps({"error": str(exc), "error_type": type(exc).__name__}, indent=2, sort_keys=True),
