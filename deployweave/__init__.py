@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from deployweave.alerts import SQLiteBudgetAlertStore, evaluate_budget_forecast
 from deployweave.policy import PolicyDecision, SQLiteBudgetPolicyEngine
+from deployweave.throttle import compute_throttle_recommendation
 from sqlite_reservation_manager import (
     ContractInactiveError,
     ContractNotFoundError,
@@ -32,5 +33,6 @@ __all__ = [
     "SQLiteReservationManager",
     "WalletError",
     "__version__",
+    "compute_throttle_recommendation",
     "evaluate_budget_forecast",
 ]

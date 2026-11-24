@@ -6,10 +6,16 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from deployweave.alerts import SQLiteBudgetAlertStore, evaluate_budget_forecast
 from deployweave.policy import DEFAULT_DB_PATH, SQLiteBudgetPolicyEngine
+from deployweave.throttle import (
+    DEFAULT_LOCAL_ONLY_THRESHOLD_PCT,
+    DEFAULT_WARN_THRESHOLD_PCT,
+    compute_throttle_recommendation,
+)
 from sqlite_reservation_manager import SQLiteReservationManager, WalletError
 
 
@@ -152,6 +158,43 @@ def _build_parser() -> argparse.ArgumentParser:
     p_alerts.add_argument("--contract-id", default=None, help="Optional contract / tenant identifier filter.")
     p_alerts.add_argument("--limit", type=int, default=50, help="Maximum number of alerts to return (default: 50).")
 
+    # policy-export
+    p_export = subparsers.add_parser(
+        "policy-export",
+        parents=[common],
+        help="Export a budget-driven auto-throttle recommendation and agent-policy-v1 payload.",
+    )
+    p_export.add_argument("--contract-id", required=True, help="Contract / tenant identifier.")
+    p_export.add_argument(
+        "--output",
+        default=None,
+        help="Optional file path to write the exported agent-policy-v1 JSON document.",
+    )
+    p_export.add_argument(
+        "--window-seconds",
+        type=int,
+        default=3600,
+        help="Rolling lookback window in seconds for burn-rate calculation (default: 3600).",
+    )
+    p_export.add_argument(
+        "--warn-threshold",
+        type=float,
+        default=DEFAULT_WARN_THRESHOLD_PCT,
+        help=f"Utilization threshold for prefer_local mode (default: {DEFAULT_WARN_THRESHOLD_PCT}).",
+    )
+    p_export.add_argument(
+        "--local-only-threshold",
+        type=float,
+        default=DEFAULT_LOCAL_ONLY_THRESHOLD_PCT,
+        help=f"Utilization threshold for local_only mode (default: {DEFAULT_LOCAL_ONLY_THRESHOLD_PCT}).",
+    )
+    p_export.add_argument(
+        "--now-ts",
+        type=float,
+        default=None,
+        help="Optional POSIX timestamp override for deterministic inspection.",
+    )
+
     return parser
 
 
@@ -280,6 +323,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "count": len(alerts),
                     "alerts": alerts,
                 }
+                _emit(result, as_json=as_json)
+                return 0
+
+            if cmd == "policy-export":
+                result = compute_throttle_recommendation(
+                    policy_engine,
+                    args.contract_id,
+                    window_seconds=args.window_seconds,
+                    now_ts=args.now_ts,
+                    warn_threshold_pct=args.warn_threshold,
+                    local_only_threshold_pct=args.local_only_threshold,
+                )
+                if args.output is not None:
+                    out_path = Path(args.output)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_text(
+                        json.dumps(result["agent_policy"], indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    result["output_path"] = str(out_path)
                 _emit(result, as_json=as_json)
                 return 0
 
