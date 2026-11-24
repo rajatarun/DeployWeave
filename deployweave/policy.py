@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from deployweave.alerts import SQLiteBudgetAlertStore
     from sqlite_reservation_manager import SQLiteReservationManager
 
 DEFAULT_DB_PATH = "deployweave_wallets.db"
@@ -99,6 +100,7 @@ class SQLiteBudgetPolicyEngine:
         reservation_manager: SQLiteReservationManager | None = None,
         *,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        alert_store: SQLiteBudgetAlertStore | None = None,
     ) -> None:
         if db_path is not None:
             raw_path = str(db_path)
@@ -110,6 +112,7 @@ class SQLiteBudgetPolicyEngine:
         self._is_memory = raw_path == ":memory:"
         self.db_path = raw_path
         self.reservation_manager = reservation_manager
+        self.alert_store = alert_store
         self._busy_timeout_ms = max(100, int(busy_timeout_ms))
 
         if not self._is_memory:
@@ -382,7 +385,7 @@ class SQLiteBudgetPolicyEngine:
 
             if daily_cap is not None and daily_used + tokens > daily_cap:
                 retry_after = max(0.0, day_end - now)
-                return PolicyDecision(
+                decision = PolicyDecision(
                     allowed=False,
                     contract_id=contract_id,
                     reason="daily_token_cap_exceeded",
@@ -396,29 +399,90 @@ class SQLiteBudgetPolicyEngine:
                     retry_after_seconds=round(retry_after, 6),
                     timestamp=now,
                 )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO policy_usage_events (contract_id, tokens, recorded_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (contract_id, tokens, now),
+                )
+                decision = PolicyDecision(
+                    allowed=True,
+                    contract_id=contract_id,
+                    reason=None,
+                    estimated_tokens=tokens,
+                    rpm_used=rpm_used + 1,
+                    max_rpm=max_rpm,
+                    tpm_used=tpm_used + tokens,
+                    max_tpm=max_tpm,
+                    daily_tokens_used=daily_used + tokens,
+                    daily_token_cap=daily_cap,
+                    retry_after_seconds=0.0,
+                    timestamp=now,
+                )
 
-            conn.execute(
+        if self.alert_store is not None and decision.daily_token_cap is not None:
+            cap = decision.daily_token_cap
+            used = decision.daily_tokens_used
+            threshold = self.alert_store.get_threshold(contract_id)
+            if decision.reason == "daily_token_cap_exceeded" or cap == 0 or used >= cap:
+                util = 1.0 if cap == 0 else round(used / cap, 6)
+                self.alert_store.record_alert(
+                    contract_id,
+                    alert_level="critical",
+                    utilization_pct=util,
+                    daily_used=used,
+                    daily_cap=cap,
+                    threshold_pct=threshold,
+                    estimated_hours_remaining=0.0,
+                    triggered_at=now,
+                )
+            elif cap > 0 and (used / cap) >= threshold:
+                self.alert_store.record_alert(
+                    contract_id,
+                    alert_level="warning",
+                    utilization_pct=round(used / cap, 6),
+                    daily_used=used,
+                    daily_cap=cap,
+                    threshold_pct=threshold,
+                    triggered_at=now,
+                )
+
+        return decision
+
+    def get_window_tokens(
+        self,
+        contract_id: str,
+        *,
+        window_seconds: int = 3600,
+        now_ts: float | None = None,
+    ) -> int:
+        """Return total tokens recorded for a contract within ``(now - window_seconds, now]``."""
+        _validate_contract_id(contract_id)
+        if isinstance(window_seconds, bool) or not isinstance(window_seconds, int):
+            raise TypeError(f"window_seconds must be an integer, got {type(window_seconds).__name__}")
+        if window_seconds <= 0:
+            raise ValueError(f"window_seconds must be positive, got {window_seconds}")
+        now = time.time() if now_ts is None else float(now_ts)
+        cutoff = now - float(window_seconds)
+
+        def _query(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
                 """
-                INSERT INTO policy_usage_events (contract_id, tokens, recorded_at)
-                VALUES (?, ?, ?)
+                SELECT COALESCE(SUM(tokens), 0) AS token_sum
+                FROM policy_usage_events
+                WHERE contract_id = ? AND recorded_at > ? AND recorded_at <= ?
                 """,
-                (contract_id, tokens, now),
-            )
+                (contract_id, cutoff, now),
+            ).fetchone()
+            return int(row["token_sum"]) if row is not None else 0
 
-            return PolicyDecision(
-                allowed=True,
-                contract_id=contract_id,
-                reason=None,
-                estimated_tokens=tokens,
-                rpm_used=rpm_used + 1,
-                max_rpm=max_rpm,
-                tpm_used=tpm_used + tokens,
-                max_tpm=max_tpm,
-                daily_tokens_used=daily_used + tokens,
-                daily_token_cap=daily_cap,
-                retry_after_seconds=0.0,
-                timestamp=now,
-            )
+        conn = self._get_connection()
+        if self._is_memory:
+            with self._conn_lock:
+                return _query(conn)
+        return _query(conn)
 
     def get_usage_summary(
         self,

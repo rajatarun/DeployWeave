@@ -6,6 +6,7 @@ Lambda handlers.
 """
 from __future__ import annotations
 
+from deployweave.alerts import SQLiteBudgetAlertStore, evaluate_budget_forecast
 from deployweave.policy import PolicyDecision, SQLiteBudgetPolicyEngine
 from sqlite_reservation_manager import (
     ContractInactiveError,
@@ -26,8 +27,10 @@ __all__ = [
     "InsufficientBalanceError",
     "PolicyDecision",
     "ReservationNotFoundError",
+    "SQLiteBudgetAlertStore",
     "SQLiteBudgetPolicyEngine",
     "SQLiteReservationManager",
     "WalletError",
     "__version__",
+    "evaluate_budget_forecast",
 ]

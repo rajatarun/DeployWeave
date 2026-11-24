@@ -8,6 +8,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
+from deployweave.alerts import SQLiteBudgetAlertStore, evaluate_budget_forecast
 from deployweave.policy import DEFAULT_DB_PATH, SQLiteBudgetPolicyEngine
 from sqlite_reservation_manager import SQLiteReservationManager, WalletError
 
@@ -21,6 +22,17 @@ def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
         if isinstance(value, dict):
             nested = ", ".join(f"{k}={v}" for k, v in value.items())
             print(f"{key}: {nested}")
+        elif isinstance(value, list):
+            if not value:
+                print(f"{key}: []")
+            else:
+                print(f"{key}:")
+                for item in value:
+                    if isinstance(item, dict):
+                        nested = ", ".join(f"{k}={v}" for k, v in item.items())
+                        print(f"  - {nested}")
+                    else:
+                        print(f"  - {item}")
         else:
             print(f"{key}: {value}")
 
@@ -110,6 +122,36 @@ def _build_parser() -> argparse.ArgumentParser:
     p_usage.add_argument("contract_id", help="Contract / tenant identifier.")
     p_usage.add_argument("--now-ts", type=float, default=None, help="Optional POSIX timestamp override for deterministic inspection.")
 
+    # forecast
+    p_forecast = subparsers.add_parser(
+        "forecast",
+        parents=[common],
+        help="Evaluate daily budget utilization, burn rate, and exhaustion forecast for a contract.",
+    )
+    p_forecast.add_argument("--contract-id", required=True, help="Contract / tenant identifier.")
+    p_forecast.add_argument(
+        "--window-seconds",
+        type=int,
+        default=3600,
+        help="Rolling lookback window in seconds for burn-rate calculation (default: 3600).",
+    )
+    p_forecast.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Soft-alert utilization threshold in (0, 1] (default: stored per-contract threshold or 0.8).",
+    )
+    p_forecast.add_argument("--now-ts", type=float, default=None, help="Optional POSIX timestamp override for deterministic inspection.")
+
+    # alerts
+    p_alerts = subparsers.add_parser(
+        "alerts",
+        parents=[common],
+        help="List recorded soft/critical budget alerts.",
+    )
+    p_alerts.add_argument("--contract-id", default=None, help="Optional contract / tenant identifier filter.")
+    p_alerts.add_argument("--limit", type=int, default=50, help="Maximum number of alerts to return (default: 50).")
+
     return parser
 
 
@@ -122,7 +164,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with (
             SQLiteReservationManager(db_path) as mgr,
-            SQLiteBudgetPolicyEngine(db_path, reservation_manager=mgr) as policy_engine,
+            SQLiteBudgetAlertStore(db_path) as alert_store,
+            SQLiteBudgetPolicyEngine(db_path, reservation_manager=mgr, alert_store=alert_store) as policy_engine,
         ):
             cmd = args.command
 
@@ -207,6 +250,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.contract_id,
                     now_ts=args.now_ts,
                 )
+                _emit(result, as_json=as_json)
+                return 0
+
+            if cmd == "forecast":
+                threshold = (
+                    args.threshold
+                    if args.threshold is not None
+                    else alert_store.get_threshold(args.contract_id)
+                )
+                result = evaluate_budget_forecast(
+                    policy_engine,
+                    args.contract_id,
+                    window_seconds=args.window_seconds,
+                    now_ts=args.now_ts,
+                    alert_threshold_pct=threshold,
+                    alert_store=alert_store,
+                )
+                _emit(result, as_json=as_json)
+                return 0
+
+            if cmd == "alerts":
+                alerts = alert_store.list_alerts(
+                    contract_id=args.contract_id,
+                    limit=args.limit,
+                )
+                result = {
+                    "contract_id": args.contract_id,
+                    "count": len(alerts),
+                    "alerts": alerts,
+                }
                 _emit(result, as_json=as_json)
                 return 0
 
